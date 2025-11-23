@@ -1,0 +1,12 @@
+### GET request to example server
+GET https://eodhd.com/api/mp/unicornbay/options/contracts
+    ?filter[underlying_symbol]=AAPL
+    &filter[strike_eq]=450
+    &filter[type]=put
+    &filter[exp_date_eq]=2027-01-15
+    &fields[options-contracts]=contract,bid_date,open,high,low,last
+    &page[limit]=5
+    &sort=-exp_date
+    &api_token=67e97fc1ecf5c7.21282307
+
+###
