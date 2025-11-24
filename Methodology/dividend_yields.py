@@ -46,15 +46,15 @@ def get_research_grade_dividend_yields():
     Perfect for HJB PDE, Monte Carlo, and volatility surface analysis
     """
     return {
-        'SPY': 0.0132,  # 1.32% - S&P 500 ETF (options-implied)
-        'QQQ': 0.0058,  # 0.58% - Nasdaq ETF (options-implied)
-        'IWM': 0.0125,  # 1.25% - Russell 2000 (options-implied)
-        'AAPL': 0.0056,  # 0.56% - Options market expectation
-        'MSFT': 0.0078,  # 0.78% - Options market expectation
-        'TSLA': 0.0001,  # 0.01% - Minimal dividend expectation
-        'XOM': 0.0342,  # 3.42% - High dividend, stable expectation
-        'JPM': 0.0208,  # 2.08% - Bank stock, options-implied
-        'NVDA': 0.0004,  # 0.04% - Accounts for growth expectations
+        'SPY': 0.0109,
+        'QQQ': 0.0048,
+        'IWM': 0.0106,
+        'AAPL': 0.0038,
+        'MSFT': 0.0077,
+        'TSLA': 0.0000,
+        'XOM': 0.0352,
+        'JPM': 0.0201,
+        'NVDA': 0.0002,
     }
 
 
