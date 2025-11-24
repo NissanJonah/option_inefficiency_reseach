@@ -1,4 +1,6 @@
 """
+This is the new code
+
 Complete Integrated Pipeline for Options Trading Research
 Just run this file and everything executes automatically
 """
@@ -1184,171 +1186,234 @@ def main():
     # Continue with HMM regime detection using only option-derived data...
     # [Rest of your HMM code remains the same]
 
-    # ===================================================================
-    # STEP 2: HMM REGIME DETECTION — REST STAYS THE SAME
-    # ===================================================================
-    print("\n" + "=" * 80)
-    print("STEP 2: HMM REGIME DETECTION (trained 2016 → train_end)")
-    print("=" * 80)
+        # ===================================================================
+        # STEP 2: HMM REGIME DETECTION — CORRECTED VERSION
+        # ===================================================================
+        print("\n" + "=" * 80)
+        print("STEP 2: HMM REGIME DETECTION (trained 2016 → train_end)")
+        print("=" * 80)
 
-    results, optimal_window = sensitivity_analysis(train_returns, WINDOW_LENGTHS, N_REGIMES)
+        # Train HMM on training period only
+        results, optimal_window = sensitivity_analysis(train_returns, WINDOW_LENGTHS, N_REGIMES)
 
-    optimal_result = results[optimal_window]
-    detector = optimal_result['detector']
-    features_df = optimal_result['features_df']
+        optimal_result = results[optimal_window]
+        detector = optimal_result['detector']
+        features_df = optimal_result['features_df']  # This is TRAINING features with 'regime' column
 
-    # DIAGNOSTIC PRINT — confirms features align perfectly with training period
-    print(
-        f"\n   Training features dates: {features_df['asofdate'].min().date()} → {features_df['asofdate'].max().date()}")
-    print(
-        f"   Features observations  : {len(features_df):,} across {features_df['underlying_symbol'].nunique()} symbols")
+        print(
+            f"\n   Training features dates: {features_df['asofdate'].min().date()} → {features_df['asofdate'].max().date()}")
+        print(
+            f"   Features observations  : {len(features_df):,} across {features_df['underlying_symbol'].nunique()} symbols")
 
-    # Show transition matrix
-    print("\nTransition Matrix (trained on pre-options data):")
-    trans_matrix = detector.get_transition_matrix()
-    regime_labels = [detector.regime_labels.get(i, f'R{i}') for i in range(N_REGIMES)]
-    trans_df = pd.DataFrame(trans_matrix, index=regime_labels, columns=regime_labels)
-    print(trans_df.round(4))
+        # Show transition matrix
+        print("\nTransition Matrix (trained on pre-options data):")
+        trans_matrix = detector.get_transition_matrix()
+        regime_labels = [detector.regime_labels.get(i, f'R{i}') for i in range(N_REGIMES)]
+        trans_df = pd.DataFrame(trans_matrix, index=regime_labels, columns=regime_labels)
+        print(trans_df.round(4))
 
-    # ===================================================================
-    # REGIME DISTRIBUTION DIAGNOSTICS
-    # ===================================================================
-    print("\n" + "=" * 80)
-    print("🔍 REGIME DISTRIBUTION CHECK")
-    print("=" * 80)
-    print("\nTRAINING PERIOD (in-sample):")
-    train_regime_dist = features_df['regime'].value_counts().sort_index()
-    for regime_idx, count in train_regime_dist.items():
-        label = detector.regime_labels.get(regime_idx, f"R{regime_idx}")
-        print(f"  {label:20} {count:,} observations ({100 * count / len(features_df):.1f}%)")
-
-    # Predict regimes for test period
-    print("\nTEST PERIOD (out-of-sample prediction):")
-    test_features = detector.prepare_features(test_returns, optimal_window)
-
-    if len(test_features) > 0:
-        # Standardize test features using same scaling as training
-        X_test_raw = np.column_stack([
-            test_features['log_return'].values,
-            test_features['realized_vol'].values
-        ])
-
-        # Use training mean/std for standardization (proper OOS)
-        X_train_raw = np.column_stack([
-            features_df['log_return'].values,
-            features_df['realized_vol'].values
-        ])
-        X_mean = X_train_raw.mean(axis=0)
-        X_std = X_train_raw.std(axis=0)
-        X_std[X_std == 0] = 1.0
-        X_test = (X_test_raw - X_mean) / X_std
-
-        test_regimes = detector.model.predict(X_test)
-        test_features['regime'] = test_regimes
-
-        test_regime_dist = pd.Series(test_regimes).value_counts().sort_index()
-        for regime_idx, count in test_regime_dist.items():
+        # ===================================================================
+        # TRAINING PERIOD DIAGNOSTICS
+        # ===================================================================
+        print("\n" + "=" * 80)
+        print("🔍 REGIME DISTRIBUTION CHECK")
+        print("=" * 80)
+        print("\nTRAINING PERIOD (in-sample):")
+        train_regime_dist = features_df['regime'].value_counts().sort_index()
+        for regime_idx, count in train_regime_dist.items():
             label = detector.regime_labels.get(regime_idx, f"R{regime_idx}")
-            print(f"  {label:20} {count:,} observations ({100 * count / len(test_regimes):.1f}%)")
+            print(f"  {label:20} {count:,} observations ({100 * count / len(features_df):.1f}%)")
 
-        # Check for regime switches
+        # ===================================================================
+        # 🔧 FIX: PROPER OUT-OF-SAMPLE REGIME PREDICTION
+        # ===================================================================
+        print("\n" + "=" * 80)
+        print("PREDICTING TEST PERIOD REGIMES (out-of-sample)")
+        print("=" * 80)
+
+        # Use FULL returns_df for rolling window calculation
+        print(f"\nUsing full return history for rolling windows...")
+        print(f"   Full data range: {returns_df['asofdate'].min().date()} → {returns_df['asofdate'].max().date()}")
+
+        # Prepare features on FULL history (includes pre-test data for windows)
+        all_features = detector.prepare_features(returns_df, optimal_window)
+
+        print(f"✓ Generated features for full period: {len(all_features):,} observations")
+        print(
+            f"   Feature date range: {all_features['asofdate'].min().date()} → {all_features['asofdate'].max().date()}")
+
+        # Split AFTER feature calculation
+        train_features_full = all_features[all_features['asofdate'] <= train_end].copy()
+        test_features_full = all_features[all_features['asofdate'] >= test_start].copy()
+
+        print(f"\nAfter split:")
+        print(f"   Train features: {len(train_features_full):,} obs")
+        print(f"   Test features:  {len(test_features_full):,} obs")
+
+        if len(test_features_full) == 0:
+            raise ValueError("No test features generated! Check date ranges.")
+
+        # ===================================================================
+        # PREDICT REGIMES FOR BOTH PERIODS
+        # ===================================================================
+
+        # Get training statistics for standardization
+        X_train_raw = np.column_stack([
+            train_features_full['log_return'].values,
+            train_features_full['realized_vol'].values
+        ])
+        X_train_mean = X_train_raw.mean(axis=0)
+        X_train_std = X_train_raw.std(axis=0)
+        X_train_std[X_train_std == 0] = 1.0
+
+        print(f"\nTraining feature statistics:")
+        print(f"   Return mean: {X_train_mean[0]:.6f}, std: {X_train_std[0]:.6f}")
+        print(f"   Vol mean:    {X_train_mean[1]:.6f}, std: {X_train_std[1]:.6f}")
+
+        # Predict TRAINING regimes (should match features_df, but ensures consistency)
+        X_train_scaled = (X_train_raw - X_train_mean) / X_train_std
+        train_regimes = detector.model.predict(X_train_scaled)
+        train_features_full['regime'] = train_regimes
+
+        # Predict TEST regimes using same scaling
+        X_test_raw = np.column_stack([
+            test_features_full['log_return'].values,
+            test_features_full['realized_vol'].values
+        ])
+        X_test_scaled = (X_test_raw - X_train_mean) / X_train_std
+        test_regimes = detector.model.predict(X_test_scaled)
+        test_features_full['regime'] = test_regimes
+
+        # ===================================================================
+        # TEST PERIOD DIAGNOSTICS
+        # ===================================================================
+        print("\nTEST PERIOD (out-of-sample prediction):")
+        test_regime_dist = pd.Series(test_regimes).value_counts().sort_index()
+
+        for regime_idx in range(N_REGIMES):
+            count = test_regime_dist.get(regime_idx, 0)
+            label = detector.regime_labels.get(regime_idx, f"R{regime_idx}")
+            pct = 100 * count / len(test_regimes) if len(test_regimes) > 0 else 0
+            print(f"  {label:20} {count:,} observations ({pct:.1f}%)")
+
         regime_changes = (pd.Series(test_regimes) != pd.Series(test_regimes).shift(1)).sum()
         print(f"\n  Regime switches in test period: {regime_changes}")
-        print(
-            f"  Test period date range: {test_features['asofdate'].min().date()} → {test_features['asofdate'].max().date()}")
 
         if test_regime_dist.nunique() == 1:
             print("\n  ⚠️  WARNING: All test data classified as single regime!")
-            print("      This may indicate:")
-            print("      1. Very stable market conditions (unlikely)")
-            print("      2. Model not generalizing well")
-            print("      3. Feature scaling issues")
-    else:
-        print("  ⚠️  No test features generated (insufficient window data)")
+        elif test_regime_dist.nunique() < N_REGIMES:
+            print(f"\n  ⚠️  WARNING: Only {test_regime_dist.nunique()}/{N_REGIMES} regimes observed")
+        else:
+            print(f"\n  ✓ Good: All {N_REGIMES} regimes observed in test period")
 
-    # After test_regimes prediction
-    print("\n🔍 REGIME DETAILS BY MONTH (TEST PERIOD):")
-    test_features['month'] = test_features['asofdate'].dt.to_period('M')
-    for month in sorted(test_features['month'].unique()):
-        month_data = test_features[test_features['month'] == month]
-        regime_counts = month_data['regime'].value_counts()
-        print(f"\n  {month}:")
-        for regime_idx in sorted(regime_counts.index):
-            label = detector.regime_labels[regime_idx]
-            count = regime_counts[regime_idx]
-            pct = 100 * count / len(month_data)
-            print(f"    {label:20} {count:3} obs ({pct:5.1f}%)")
+        # ===================================================================
+        # PER-SYMBOL DIAGNOSTICS
+        # ===================================================================
+        print("\n" + "=" * 80)
+        print("🔍 TEST PERIOD REGIME DISTRIBUTION BY SYMBOL")
+        print("=" * 80)
 
-    # TRAINING PERIOD VISUALIZATION
-    print("\nGenerating TRAINING PERIOD visualization...")
-    visualize_regimes(features_df, detector, underlying_df, optimal_window, train_end_date=train_end)
+        for symbol in sorted(test_features_full['underlying_symbol'].unique()):
+            symbol_test = test_features_full[test_features_full['underlying_symbol'] == symbol]
+            print(f"\n{symbol}: ({len(symbol_test)} days)")
 
-    # ===================================================================
-    # SAVE MODEL
-    # ===================================================================
-    print("\nSaving HMM regime model...")
+            regime_counts = symbol_test['regime'].value_counts().sort_index()
+            for regime_idx in range(N_REGIMES):
+                count = regime_counts.get(regime_idx, 0)
+                label = detector.regime_labels.get(regime_idx, f"R{regime_idx}")
+                pct = 100 * count / len(symbol_test) if len(symbol_test) > 0 else 0
+                print(f"  {label:20} {count:4} days ({pct:5.1f}%)")
 
-    # Combine train and test regime sequences for full history
-    full_regime_sequence = pd.concat([
-        features_df[['asofdate', 'underlying_symbol', 'regime']],
-        test_features[['asofdate', 'underlying_symbol', 'regime']] if len(test_features) > 0 else pd.DataFrame()
-    ], ignore_index=True)
+        # ===================================================================
+        # PER-MONTH DIAGNOSTICS
+        # ===================================================================
+        print("\n" + "=" * 80)
+        print("🔍 REGIME DISTRIBUTION BY MONTH (TEST PERIOD)")
+        print("=" * 80)
 
-    save_data = {
-        'optimal_window': optimal_window,
-        'n_regimes': N_REGIMES,
-        'regime_params': detector.regime_params,
-        'regime_labels': detector.regime_labels,
-        'transition_matrix': trans_matrix,
-        'regime_sequence': full_regime_sequence,
-        'hmm_model': detector.model,
-        'model_metadata': {
-            'trained_on': f"{train_start.date()} → {train_end.date()}",
-            'test_period': f"{test_start.date()} → {test_end.date()}",
-            'first_options_date': str(first_asof.date()),  # ADD THIS
-            'log_likelihood': detector.model.monitor_.history[-1],
-            'feature_window': optimal_window,
-            'train_regime_distribution': train_regime_dist.to_dict(),
-            'test_regime_distribution': test_regime_dist.to_dict() if len(test_features) > 0 else {}
+        test_features_full['month'] = test_features_full['asofdate'].dt.to_period('M')
+        for month in sorted(test_features_full['month'].unique()):
+            month_data = test_features_full[test_features_full['month'] == month]
+            print(f"\n{month}:")
+            regime_counts = month_data['regime'].value_counts().sort_index()
+            for regime_idx in range(N_REGIMES):
+                count = regime_counts.get(regime_idx, 0)
+                label = detector.regime_labels.get(regime_idx, f"R{regime_idx}")
+                pct = 100 * count / len(month_data) if len(month_data) > 0 else 0
+                print(f"  {label:20} {count:3} obs ({pct:5.1f}%)")
+
+        # ===================================================================
+        # VISUALIZATION
+        # ===================================================================
+        print("\nGenerating TRAINING PERIOD visualization...")
+        visualize_regimes(features_df, detector, underlying_df, optimal_window, train_end_date=train_end)
+
+        # ===================================================================
+        # SAVE MODEL WITH FULL REGIME HISTORY
+        # ===================================================================
+        print("\n" + "=" * 80)
+        print("SAVING HMM MODEL WITH FULL REGIME HISTORY")
+        print("=" * 80)
+
+        # NOW both train_features_full and test_features_full have 'regime' columns!
+        full_regime_sequence = pd.concat([
+            train_features_full[['asofdate', 'underlying_symbol', 'regime']],
+            test_features_full[['asofdate', 'underlying_symbol', 'regime']]
+        ], ignore_index=True).drop_duplicates(subset=['asofdate', 'underlying_symbol'])
+
+        print(f"✓ Full regime sequence: {len(full_regime_sequence):,} observations")
+        print(
+            f"   Date range: {full_regime_sequence['asofdate'].min().date()} → {full_regime_sequence['asofdate'].max().date()}")
+
+        save_data = {
+            'optimal_window': optimal_window,
+            'n_regimes': N_REGIMES,
+            'regime_params': detector.regime_params,
+            'regime_labels': detector.regime_labels,
+            'transition_matrix': trans_matrix,
+            'regime_sequence': full_regime_sequence,
+            'hmm_model': detector.model,
+            'feature_scaling': {
+                'mean': X_train_mean,
+                'std': X_train_std
+            },
+            'model_metadata': {
+                'trained_on': f"{train_start.date()} → {train_end.date()}",
+                'test_period': f"{test_start.date()} → {test_end.date()}",
+                'first_options_date': str(first_asof.date()),
+                'log_likelihood': detector.model.monitor_.history[-1],
+                'feature_window': optimal_window,
+                'train_regime_distribution': train_regime_dist.to_dict(),
+                'test_regime_distribution': test_regime_dist.to_dict()
+            }
         }
-    }
 
-    with open('hmm_regime_model.pkl', 'wb') as f:
-        pickle.dump(save_data, f)
+        with open('hmm_regime_model.pkl', 'wb') as f:
+            pickle.dump(save_data, f)
 
-    print("✓ HMM model saved → hmm_regime_model.pkl")
-    print("\nGenerating regime parameter visualizations...")
-    plot_regime_parameters(save_data)
-    plot_regime_parameters_by_symbol(returns_df, features_df, detector)
+        print("✓ HMM model saved → hmm_regime_model.pkl")
 
-    # ===================================================================
-    # FULL HISTORY VISUALIZATION — THE MONEY PLOT
-    # ===================================================================
-    print("\n" + "=" * 80)
-    print("GENERATING FULL HISTORY REGIME PLOTS (with Train/Test split)")
-    print("=" * 80)
+        # Continue with visualizations...
+        print("\nGenerating regime parameter visualizations...")
+        plot_regime_parameters(save_data)
+        plot_regime_parameters_by_symbol(returns_df, features_df, detector)
 
-    # SPY first — the star of the show
-    visualize_historical_regimes(save_data, underlying_df, symbol='SPY', train_end_date=train_end)
+        # Full history plots
+        print("\n" + "=" * 80)
+        print("GENERATING FULL HISTORY REGIME PLOTS (with Train/Test split)")
+        print("=" * 80)
 
-    # Other major underlyings
-    for sym in ['QQQ', 'IWM', 'AAPL', 'TSLA', 'MSFT', 'XOM', 'JPM']:
-        if sym in underlying_df['underlying_symbol'].unique():
-            visualize_historical_regimes(save_data, underlying_df, symbol=sym, train_end_date=train_end)
+        visualize_historical_regimes(save_data, underlying_df, symbol='SPY', train_end_date=train_end)
 
-    print("\n" + "=" * 80)
-    print("PIPELINE COMPLETED SUCCESSFULLY")
-    print("=" * 80)
-    print(
-        f"   • HMM trained ONLY on {train_start.date()} → {train_end.date()} ({(train_end - train_start).days / 365.25:.1f} years)")
-    print(f"   • All {len(test_options):,} options contracts are 100% true out-of-sample")
-    print("   • Regimes properly capture COVID crash, 2022 bear, and 2021 bull")
-    print("   • Beautiful plots with clear TRAIN → TEST boundary")
-    print("   • Model saved and ready for MIS scoring, HJB, Monte Carlo")
-    print("   • Next: Run Step 3 → Regime-Based Option Mispricing Detection")
-    print("=" * 80)
+        for sym in ['QQQ', 'IWM', 'AAPL', 'TSLA', 'MSFT', 'XOM', 'JPM']:
+            if sym in underlying_df['underlying_symbol'].unique():
+                visualize_historical_regimes(save_data, underlying_df, symbol=sym, train_end_date=train_end)
 
-    return save_data
+        print("\n" + "=" * 80)
+        print("PIPELINE COMPLETED SUCCESSFULLY")
+        print("=" * 80)
+
+        return save_data
 
 
 if __name__ == "__main__":
@@ -1370,6 +1435,7 @@ with open('hmm_regime_model.pkl', 'rb') as f:
 # Access regime parameters for each regime
 regime_params = hmm_data['regime_params']
 # Example: regime_params[0] = {'mu': 0.15, 'sigma': 0.20, 'lambda': 5.2}
+
 
 # Access transition matrix
 transition_matrix = hmm_data['transition_matrix']

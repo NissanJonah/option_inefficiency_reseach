@@ -27,7 +27,7 @@ print("""
 CONFIG = {
     'output_file': 'hjb_optimal_boundaries.pkl',
     'risk_free_rate': 0.04,
-    'dividend_yields': get_dividend_yields(['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSLA', 'XOM', 'JPM']),
+    'dividend_yields': get_dividend_yields(['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'XOM', 'JPM']),
     'S_min_factor': 0.1,
     'S_max_factor': 2.0,
     'n_S_points': 800,
@@ -41,6 +41,7 @@ SYMBOLS = ['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSLA', 'XOM', 'JPM']
 
 class DataLoader:
     """Load required inputs from previous steps"""
+
 
     def __init__(self):
         self.hmm_data = None
@@ -144,19 +145,24 @@ class HJBSolver:
     Constraint: V(S,t) ≥ max(K - S, 0) (American put payoff)
     """
 
-    def __init__(self, S0, K, T, r, q, sigma, lambda_j, mu_J, sigma_J):
-        self.S0 = S0  # Current spot price
-        self.K = K    # Strike price
-        self.T = T    # Time to expiration
-        self.r = r    # Risk-free rate
-        self.q = q    # Dividend yield
-        self.sigma = sigma  # Volatility
-        self.lambda_j = lambda_j  # Jump intensity
-        self.mu_J = mu_J  # Mean log jump size
-        self.sigma_J = sigma_J  # Jump volatility
-        self.kappa = np.exp(mu_J + 0.5*sigma_J**2) - 1  # Expected jump
+    def __init__(self, S0, K, T, r, q, sigma, lambda_j, mu_J, sigma_J, option_type='put'):
+        self.S0 = S0
+        self.K = K
+        self.T = T
+        self.r = r
+        self.q = q
+        self.sigma = sigma
+        self.lambda_j = lambda_j
+        self.mu_J = mu_J
+        self.sigma_J = sigma_J
+        self.option_type = option_type.lower()
+        self.kappa = np.exp(mu_J + 0.5 * sigma_J ** 2) - 1
+
+        if self.option_type not in ['put', 'call']:
+            raise ValueError("option_type must be 'put' or 'call'")
 
         self._setup_grids()
+
 
     def _setup_grids(self):
         """Setup spatial and temporal grids"""
@@ -177,9 +183,13 @@ class HJBSolver:
         self.dt = self.T / (self.n_T - 1)
         self.t_grid = np.linspace(0, self.T, self.n_T)
 
+
     def _payoff(self, S):
-        """American put payoff: max(K - S, 0)"""
-        return np.maximum(self.K - S, 0)
+        """American option payoff"""
+        if self.option_type == 'put':
+            return np.maximum(self.K - S, 0)
+        else:  # call
+            return np.maximum(S - self.K, 0)
 
     def _setup_jump_weights(self):
         """
@@ -349,58 +359,101 @@ class HJBSolver:
             # For American puts: exercise when S drops below boundary
             # Boundary = highest S where holding value ≈ intrinsic value
 
+            # === CORRECTED BOUNDARY DETECTION (NO DUPLICATED MASK) ===
             intrinsic = payoff
             time_value = V_new - intrinsic
 
-            # Only consider ITM region (S < K for puts)
-            itm_mask = S < self.K
+            # Define ITM region based on option type
+            if self.option_type == 'put':
+                exercise_region_mask = S < self.K
+                search_direction = 'highest'  # find highest S where time value ≈ 0
+            else:  # call
+                exercise_region_mask = S > self.K
+                search_direction = 'lowest'  # find lowest S where time value ≈ 0
 
-            if not np.any(itm_mask):
-                # No ITM region - boundary doesn't matter
-                boundaries[t_idx] = self.K * 0.95
+            if not np.any(exercise_region_mask):
+                # No ITM points — use fallback
+                fallback = self.K * (0.90 if self.option_type == 'put' else 1.10)
+                boundaries[t_idx] = fallback
                 continue
 
-            itm_indices = np.where(itm_mask)[0]
-            time_value_itm = time_value[itm_indices]
-            S_itm = S[itm_indices]
+            # Extract time value only in exercise region
+            S_itm = S[exercise_region_mask]
+            tv_itm = time_value[exercise_region_mask]
 
-            # Find where time value drops to near zero
-            # (early exercise becomes optimal)
-            # Exercise boundary defined where time value < 0.1% of strike
-            # Following numerical PDE literature [Wilmott 2006]
-            threshold = 0.001 * self.K
-            near_zero = time_value_itm < threshold
+            # CORRECTED: Find where V(S) ≈ intrinsic AND derivative condition holds
+            threshold = 0.01 * self.K  # More realistic threshold
 
-            if np.any(near_zero):
-                # Find highest S in ITM region where time value ≈ 0
-                boundary_idx_local = np.where(near_zero)[0][-1]  # Last (highest S) index
-                boundary_idx_global = itm_indices[boundary_idx_local]
+            # For puts: find highest S where V ≈ intrinsic (exercise region starts)
+            # For calls: find lowest S where V ≈ intrinsic
+            if self.option_type == 'put':
+                # Put boundary: highest S where V(S) = K - S
+                exercise_region_mask = S < self.K * 0.98  # Focus on ITM region
 
-                # Interpolate for precision
-                if boundary_idx_global < self.n_S - 1:
-                    idx1 = boundary_idx_global
-                    idx2 = min(boundary_idx_global + 1, self.n_S - 1)
-                    tv1 = time_value[idx1]
-                    tv2 = time_value[idx2]
+                if not np.any(exercise_region_mask):
+                    boundaries[t_idx] = self.K * 0.70  # Default deep ITM
+                    continue
 
-                    if abs(tv2 - tv1) > 1e-10:
-                        w = (threshold - tv1) / (tv2 - tv1)
-                        w = np.clip(w, 0, 1)
-                        boundaries[t_idx] = S[idx1] + w * (S[idx2] - S[idx1])
+                S_exercise = S[exercise_region_mask]
+                V_exercise = V_new[exercise_region_mask]
+                intrinsic_exercise = self.K - S_exercise
+
+                # Find where V is within 1% of intrinsic
+                relative_diff = np.abs(V_exercise - intrinsic_exercise) / np.maximum(intrinsic_exercise, 0.01)
+                near_intrinsic = relative_diff < 0.01
+
+                if np.any(near_intrinsic):
+                    # Get the HIGHEST S where this holds (boundary)
+                    candidate_indices = np.where(near_intrinsic)[0]
+                    local_idx = candidate_indices[-1]  # Rightmost = highest S
+                    global_idx = np.where(exercise_region_mask)[0][local_idx]
+                    boundaries[t_idx] = S[global_idx]
+                else:
+                    # No clear boundary - use gradient method
+                    # dV/dS should be -1 at boundary for puts
+                    dV_dS = np.gradient(V_exercise, S_exercise)
+                    close_to_minus_one = np.abs(dV_dS + 1.0) < 0.2
+
+                    if np.any(close_to_minus_one):
+                        local_idx = np.where(close_to_minus_one)[0][-1]
+                        global_idx = np.where(exercise_region_mask)[0][local_idx]
+                        boundaries[t_idx] = S[global_idx]
                     else:
-                        boundaries[t_idx] = S[idx1]
+                        boundaries[t_idx] = self.K * 0.80  # Conservative fallback
+
+            else:  # call
+                # Call boundary: lowest S where V(S) = S - K
+                exercise_region_mask = S > self.K * 1.02
+
+                if not np.any(exercise_region_mask):
+                    boundaries[t_idx] = self.K * 1.30
+                    continue
+
+                S_exercise = S[exercise_region_mask]
+                V_exercise = V_new[exercise_region_mask]
+                intrinsic_exercise = S_exercise - self.K
+
+                relative_diff = np.abs(V_exercise - intrinsic_exercise) / np.maximum(intrinsic_exercise, 0.01)
+                near_intrinsic = relative_diff < 0.01
+
+                if np.any(near_intrinsic):
+                    candidate_indices = np.where(near_intrinsic)[0]
+                    local_idx = candidate_indices[0]  # Leftmost = lowest S
+                    global_idx = np.where(exercise_region_mask)[0][local_idx]
+                    boundaries[t_idx] = S[global_idx]
                 else:
-                    boundaries[t_idx] = S[boundary_idx_global]
-            else:
-                # No clear boundary found - use approximation
-                # For r > q, boundary ≈ K * r/(r-q+ε) but bounded above by K
-                tau = self.T - self.t_grid[t_idx]
-                if tau > 0 and self.r > self.q:
-                    approx = self.K * self.r / (self.r - self.q + 0.01)
-                    boundaries[t_idx] = min(approx, self.K * 0.98)
-                else:
-                    # Short maturity or r ≤ q: boundary near strike
-                    boundaries[t_idx] = self.K * 0.95
+                    dV_dS = np.gradient(V_exercise, S_exercise)
+                    close_to_plus_one = np.abs(dV_dS - 1.0) < 0.2
+
+                    if np.any(close_to_plus_one):
+                        local_idx = np.where(close_to_plus_one)[0][0]
+                        global_idx = np.where(exercise_region_mask)[0][local_idx]
+                        boundaries[t_idx] = S[global_idx]
+                    else:
+                        boundaries[t_idx] = self.K * 1.20
+
+
+
 
         # Interpolate value at S0
         V_american = np.interp(self.S0, S, V[:, 0])
@@ -411,11 +464,16 @@ class HJBSolver:
 
         # More realistic reachability check
         # For short-dated near-ATM puts, boundary should be close to K
-        boundary_reachable = (
-            boundary_t0 < self.K and  # Must be below strike
-            boundary_t0 > self.S0 * 0.7 and  # Within reasonable drop (30%)
-            boundary_t0 < self.S0  # Below current spot
-        )
+        if self.option_type == 'put':
+            boundary_reachable = (boundary_t0 < self.K and boundary_t0 < self.S0)
+        else:  # call
+            boundary_reachable = (boundary_t0 > self.K and boundary_t0 > self.S0)
+
+        # Optional: add reasonable reachability (e.g. within 30% move)
+        if self.option_type == 'put':
+            boundary_reachable = boundary_reachable and (boundary_t0 > self.S0 * 0.7)
+        else:
+            boundary_reachable = boundary_reachable and (boundary_t0 < self.S0 * 1.3)
 
         # Calculate early exercise premium (difference from intrinsic)
         intrinsic_value = max(self.K - self.S0, 0)
@@ -494,60 +552,78 @@ def get_regime_for_date(regime_sequence, symbol, asofdate):
 
     return None
 
-def select_contract(contracts):
-    """Select best contract for HJB analysis"""
+
+def select_contracts(contracts):
+    """
+    Select best CALL and best PUT for HJB analysis
+    Returns: {'call': contract_dict or None, 'put': contract_dict or None}
+    """
     if len(contracts) == 0:
-        return None
+        return {'call': None, 'put': None}
 
-    puts = contracts[contracts['option_type'] == 'put'].copy()
+    result = {'call': None, 'put': None}
 
-    if len(puts) == 0:
-        return None
+    # Filter by DTE (30-180 days)
+    valid = contracts[(contracts['days_to_exp'] >= 30) &
+                      (contracts['days_to_exp'] <= 180)].copy()
 
-    # Filter by DTE
-    puts = puts[(puts['days_to_exp'] >= 30) & (puts['days_to_exp'] <= 180)]
+    if len(valid) == 0:
+        return result
 
-    if len(puts) == 0:
-        return None
+    valid['abs_moneyness'] = np.abs(valid['log_moneyness'])
 
-    # Prefer slightly ITM puts
-    puts['abs_moneyness'] = np.abs(puts['log_moneyness'])
-    itm_puts = puts[(puts['log_moneyness'] > 0) & (puts['log_moneyness'] < 0.1)]
+    # === SELECT BEST PUT ===
+    puts = valid[valid['option_type'] == 'put']
+    if len(puts) > 0:
+        # Prefer slightly ITM puts (log_moneyness > 0)
+        itm_puts = puts[(puts['log_moneyness'] > 0) & (puts['log_moneyness'] < 0.1)]
 
-    if len(itm_puts) > 0:
-        best = itm_puts.nsmallest(1, 'abs_moneyness').iloc[0]
-    else:
-        best = puts.nsmallest(1, 'abs_moneyness').iloc[0]
+        if len(itm_puts) > 0:
+            best_put = itm_puts.nsmallest(1, 'abs_moneyness').iloc[0]
+        else:
+            best_put = puts.nsmallest(1, 'abs_moneyness').iloc[0]
 
-    print(f"   Selected: K=${best['strike']:.2f}, S=${best['underlying_price']:.2f}, "
-          f"DTE={best['days_to_exp']:.0f}")
+        result['put'] = best_put.to_dict()
+        print(f"   Selected PUT: K=${best_put['strike']:.2f}, S=${best_put['underlying_price']:.2f}, "
+              f"DTE={best_put['days_to_exp']:.0f}, Moneyness={best_put['log_moneyness']:.3f}")
 
-    return best.to_dict()
+    # === SELECT BEST CALL ===
+    calls = valid[valid['option_type'] == 'call']
+    if len(calls) > 0:
+        # Prefer slightly ITM calls (log_moneyness < 0, since S > K)
+        itm_calls = calls[(calls['log_moneyness'] < 0) & (calls['log_moneyness'] > -0.1)]
+
+        if len(itm_calls) > 0:
+            best_call = itm_calls.nsmallest(1, 'abs_moneyness').iloc[0]
+        else:
+            best_call = calls.nsmallest(1, 'abs_moneyness').iloc[0]
+
+        result['call'] = best_call.to_dict()
+        print(f"   Selected CALL: K=${best_call['strike']:.2f}, S=${best_call['underlying_price']:.2f}, "
+              f"DTE={best_call['days_to_exp']:.0f}, Moneyness={best_call['log_moneyness']:.3f}")
+
+    return result
 
 
 def main():
-    """Main execution - REGIME-AWARE VERSION"""
+    """FIXED MAIN - Solves for BOTH calls and puts per symbol"""
 
-    # Load data
     loader = DataLoader().load_all()
     if loader is None:
-        print("\n✗ Failed to load required data. Run Steps 2, 3, and 5 first.")
+        print("\n✗ Failed to load required data")
         return
 
-    n_regimes = loader.hmm_data['n_regimes']
-    regime_labels = loader.hmm_data['regime_labels']
     regime_sequence = loader.hmm_data['regime_sequence']
 
     print("\n" + "=" * 70)
-    print("SOLVING HJB PDE FOR OPTIMAL EXERCISE BOUNDARIES")
-    print("Using ACTUAL regime for each contract's date")
+    print("SOLVING HJB PDE FOR CALLS AND PUTS")
     print("=" * 70)
 
     results = {
         'generated': datetime.now().isoformat(),
         'solutions': {},
-        'n_regimes': n_regimes,
-        'regime_labels': regime_labels
+        'n_regimes': loader.hmm_data['n_regimes'],
+        'regime_labels': loader.hmm_data['regime_labels']
     }
 
     r = CONFIG['risk_free_rate']
@@ -560,79 +636,83 @@ def main():
         print('=' * 70)
 
         contracts = loader.get_contracts(symbol)
-
         if len(contracts) == 0:
             print(f"   No contracts for {symbol}")
             continue
 
-        contract = select_contract(contracts)
-        if contract is None:
-            print(f"   No suitable contract for {symbol}")
-            continue
-
-        # NEW: Get contract's actual date and regime
-        asofdate = pd.to_datetime(contract['asofdate']).normalize()
-
-        # NEW: Find the ACTUAL regime for this contract's date
-        actual_regime = get_regime_for_date(regime_sequence, symbol, asofdate)
-
-        if actual_regime is None:
-            print(f"   ⚠️ Could not determine regime for {asofdate.date()} - skipping {symbol}")
-            continue
-
-        actual_regime_label = regime_labels[actual_regime]
-
-        print(f"\n   Contract Details:")
-        print(f"   Date: {asofdate.date()}")
-        print(f"   Actual Regime: {actual_regime_label} (regime {actual_regime})")
-        print(
-            f"   K=${contract['strike']:.2f}, S=${contract['underlying_price']:.2f}, DTE={contract['days_to_exp']:.0f}")
-
-        S = contract['underlying_price']
-        K = contract['strike']
-        T = contract['tte']
+        # NEW: Get BOTH call and put
+        selected = select_contracts(contracts)
 
         results['solutions'][symbol] = {}
 
-        # CHANGED: Solve ONLY for the actual regime (not all 4)
-        print(f"\n{'=' * 70}")
-        print(f"SOLVING FOR ACTUAL REGIME: {actual_regime_label}")
-        print('=' * 70)
+        # === Process EACH option type separately ===
+        for opt_type in ['call', 'put']:
+            contract = selected[opt_type]
 
-        rp = loader.get_regime_params(actual_regime)
-        jp = loader.get_jump_params(symbol, actual_regime)
+            if contract is None:
+                print(f"\n   No suitable {opt_type.upper()} for {symbol}")
+                continue
 
-        # Extract lambda from jump params
-        lambda_j = jp.get('lambda_j', 0.0)
+            print(f"\n{'─' * 70}")
+            print(f"PROCESSING {opt_type.upper()}")
+            print('─' * 70)
 
-        try:
-            solver = HJBSolver(
-                S0=S, K=K, T=T, r=r, q=q,
-                sigma=rp['sigma'],
-                lambda_j=lambda_j,
-                mu_J=jp['mu_J'],
-                sigma_J=jp['sigma_J']
-            )
+            # Get regime for this contract's date
+            asofdate = pd.to_datetime(contract['asofdate']).normalize()
+            actual_regime = get_regime_for_date(regime_sequence, symbol, asofdate)
 
-            hjb_solution = solver.solve()
+            if actual_regime is None:
+                print(f"   ⚠️ No regime found for {opt_type} - skipping")
+                continue
 
-            # CHANGED: Store under 'actual' key instead of regime index
-            results['solutions'][symbol]['actual'] = {
-                'regime_idx': actual_regime,
-                'label': actual_regime_label,
-                'asofdate': asofdate.date().isoformat(),
-                'hjb': hjb_solution,
-                'contract': contract,
-                'regime_params': rp,
-                'jump_params': jp
-            }
+            regime_label = results['regime_labels'][actual_regime]
 
-        except Exception as e:
-            print(f"   ✗ Error: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"   Date: {asofdate.date()}")
+            print(f"   Regime: {regime_label} (regime {actual_regime})")
 
-    # Save results
+            # Get regime parameters
+            rp = loader.get_regime_params(actual_regime)
+            jp = loader.get_jump_params(symbol, actual_regime)
+
+            S = contract['underlying_price']
+            K = contract['strike']
+            T = contract['tte']
+
+            try:
+                solver = HJBSolver(
+                    S0=S, K=K, T=T, r=r, q=q,
+                    sigma=rp['sigma'],
+                    lambda_j=jp.get('lambda_j', 0.0),
+                    mu_J=jp['mu_J'],
+                    sigma_J=jp['sigma_J'],
+                    option_type=opt_type  # ← KEY: Pass the actual type
+                )
+
+                hjb_solution = solver.solve()
+
+                # Store under option type
+                if opt_type not in results['solutions'][symbol]:
+                    results['solutions'][symbol][opt_type] = {}
+
+                results['solutions'][symbol][opt_type]['actual'] = {
+                    'regime_idx': actual_regime,
+                    'label': regime_label,
+                    'asofdate': asofdate.date().isoformat(),
+                    'option_type': opt_type,
+                    'hjb': hjb_solution,
+                    'contract': contract,
+                    'regime_params': rp,
+                    'jump_params': jp
+                }
+
+                print(f"   ✓ {opt_type.upper()} solved successfully")
+
+            except Exception as e:
+                print(f"   ✗ Error solving {opt_type}: {e}")
+                import traceback
+                traceback.print_exc()
+
+    # Save
     with open(CONFIG['output_file'], 'wb') as f:
         pickle.dump(results, f)
 
@@ -643,23 +723,22 @@ def main():
     print("SUMMARY")
     print("=" * 70)
 
-    total_solved = 0
-    for sym, sol in results['solutions'].items():
-        if 'actual' in sol:
-            data = sol['actual']
-            hjb = data['hjb']
-            print(f"\n{sym}:")
-            print(f"  Date: {data['asofdate']}")
-            print(f"  Regime: {data['label']}")
-            print(f"  Value: ${hjb['american']:.4f}")
-            print(f"  Boundary: ${hjb['boundary_t0']:.2f} "
-                  f"({'reachable' if hjb['boundary_reachable'] else 'not reachable'})")
-            total_solved += 1
-        else:
-            print(f"\n{sym}: No solution (regime not found)")
+    for sym, sols in results['solutions'].items():
+        print(f"\n{sym}:")
+        for opt_type in ['call', 'put']:
+            if opt_type in sols and 'actual' in sols[opt_type]:
+                data = sols[opt_type]['actual']
+                hjb = data['hjb']
+                print(f"  {opt_type.upper()}:")
+                print(f"    Regime: {data['label']}")
+                print(f"    Value: ${hjb['american']:.4f}")
+                print(f"    Boundary: ${hjb['boundary_t0']:.2f}")
+            else:
+                print(f"  {opt_type.upper()}: Not solved")
 
-    print(f"\n✓ Successfully solved {total_solved}/{len(SYMBOLS)} contracts")
     print("=" * 70)
+
+
 
     return results
 

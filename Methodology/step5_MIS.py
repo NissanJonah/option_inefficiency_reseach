@@ -386,6 +386,7 @@ with open(OUTPUT_FILE, 'wb') as f:
 
 import os
 size_mb = os.path.getsize(OUTPUT_FILE) / 1e6
+
 print(f"\n✓ MIS scores saved → {OUTPUT_FILE} ({size_mb:.1f} MB)")
 
 print("\n" + "=" * 70)

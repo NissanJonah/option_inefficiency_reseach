@@ -1,6 +1,8 @@
 """
 STEP 4: ARBITRAGE-FREE IV SURFACE CONSTRUCTION - CORRECTED
 
+
+
 Key fixes:
 1. Use step1_redone_filtering for data preparation
 2. Apply filters BEFORE Black-Scholes pricing
@@ -22,7 +24,7 @@ from step1_redone_filtering import OptionsDataFilter
 from dividend_yields import get_dividend_yields
 from step2_hmm_regime_detection import connect_to_db
 from psycopg2.extras import RealDictCursor
-DIVIDEND_YIELDS = get_dividend_yields(['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSLA', 'XOM', 'JPM'])
+DIVIDEND_YIELDS = get_dividend_yields(['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'XOM', 'JPM'])
 
 # ================================
 # CONFIG
@@ -30,7 +32,7 @@ DIVIDEND_YIELDS = get_dividend_yields(['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSL
 OUTPUT_FILE = "iv_surfaces_arbitrage_free.pkl"
 MONEYNESS_GRID = np.linspace(-0.5, 0.5, 101)
 DTE_GRID = np.array([1, 3, 7, 14, 21, 30, 45, 60, 90, 120, 150, 180, 252, 365])
-SYMBOLS = ['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSLA', 'XOM', 'JPM']
+SYMBOLS = ['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'XOM', 'JPM']
 
 
 
@@ -496,16 +498,34 @@ def build_iv_surface_for_day(day_data):
     tte_grid_years = DTE_GRID / 365.25
 
     for j in range(len(MONEYNESS_GRID)):
-        variance_col = np.array([iv_row[j] ** 2 * t for t, iv_row in zip(ttes, iv_rows)])
+        # Collect total variance for this moneyness across all available T
+        total_variance = []
+        available_tte = []
 
-        if len(variance_col) < 2:
+        for i, (t, iv_row) in enumerate(zip(ttes, iv_rows)):
+            if not np.isnan(iv_row[j]):
+                total_variance.append(iv_row[j] ** 2 * t)
+                available_tte.append(t)
+
+        if len(total_variance) < 2:
             continue
 
+        # Sort by maturity
+        idx = np.argsort(available_tte)
+        available_tte = np.array(available_tte)[idx]
+        total_variance = np.array(total_variance)[idx]
+
+        # ENFORCE MONOTONICITY: total variance must be non-decreasing
+        total_variance = np.maximum.accumulate(total_variance)
+
+        # Interpolate monotonic total variance
         try:
-            f = interp1d(ttes, variance_col, kind='linear', bounds_error=False, fill_value='extrapolate')
-            total_var = f(tte_grid_years)
-            total_var = np.maximum.accumulate(total_var)
-            grid_final[:, j] = np.sqrt(total_var / np.maximum(tte_grid_years, 1/36525))
+            f = interp1d(available_tte, total_variance, kind='linear',
+                         bounds_error=False, fill_value='extrapolate')
+            total_var_interp = f(tte_grid_years)
+
+            # Convert back to implied volatility
+            grid_final[:, j] = np.sqrt(total_var_interp / np.maximum(tte_grid_years, 1 / 36525))
         except:
             continue
 
@@ -562,6 +582,7 @@ save_data = {
         'total_raw_quotes': int(initial_count),
         'total_clean_quotes': int(after_count),
         'pcp_corrections': int(pcp_corrections),
+
         'surfaces_built': int(total_built),
     }
 }
