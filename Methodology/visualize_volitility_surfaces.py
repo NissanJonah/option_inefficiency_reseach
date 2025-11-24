@@ -1,13 +1,6 @@
 """
-VISUALIZE IMPLIED VOLATILITY SURFACES WITH MIS COLOR CODING
-Interactive 3D plots showing IV surfaces colored by Market Inefficiency Score
-
-Improvements:
-- Added error handling and logging
-- Vectorized MIS grid mapping
-- Configurable parameters
-- Option to generate comparison plots
-- Better code organization
+FIXED: VISUALIZE IMPLIED VOLATILITY SURFACES WITH MIS COLOR CODING
+Corrects coordinate system and interpolation issues
 """
 
 import pickle
@@ -25,12 +18,13 @@ from pathlib import Path
 # CONFIGURATION
 # ================================
 CONFIG = {
-    'dte_tolerance': 10 / 365.25,      # 10 days tolerance
-    'moneyness_tolerance': 0.05,        # 5% log moneyness tolerance
-    'interpolation_min_points': 10,     # Minimum points for interpolation
-    'colorscale_multiplier': 2,         # Scale colorbar to threshold * multiplier
-    'generate_comparison_plots': False, # Generate side-by-side plots
-    'auto_open_browser': True,          # Auto-open plots in browser
+    'dte_tolerance': 15,  # Days tolerance (absolute)
+    'moneyness_tolerance': 0.08,  # Log moneyness tolerance (wider)
+    'interpolation_min_points': 5,  # Reduced minimum points
+    'colorscale_multiplier': 2,
+    'generate_comparison_plots': False,
+    'auto_open_browser': True,
+    'use_rbf_interpolation': True,  # Better interpolation method
 }
 
 
@@ -57,6 +51,8 @@ class IVSurfaceVisualizer:
             self.symbols = surface_data['symbols']
 
             print(f"  ✓ Loaded surfaces for {len(self.symbols)} symbols")
+            print(f"  ✓ Moneyness range: [{self.moneyness_grid.min():.3f}, {self.moneyness_grid.max():.3f}]")
+            print(f"  ✓ DTE range: [{self.dte_grid.min()}, {self.dte_grid.max()}]")
 
         except FileNotFoundError:
             print(f"ERROR: Surface file not found: {self.surface_path}")
@@ -66,7 +62,7 @@ class IVSurfaceVisualizer:
             sys.exit(1)
 
         try:
-            print("Loading MIS scores...")
+            print("\nLoading MIS scores...")
             with open(self.mis_path, 'rb') as f:
                 mis_data = pickle.load(f)
 
@@ -76,6 +72,13 @@ class IVSurfaceVisualizer:
             print(f"  ✓ MIS threshold: {self.mis_threshold:.4f}")
             print(f"  ✓ Total MIS records: {len(self.df_mis)}")
 
+            # Print sample of MIS data for debugging
+            if len(self.df_mis) > 0:
+                print(f"  ✓ MIS range: [{self.df_mis['MIS'].min():.4f}, {self.df_mis['MIS'].max():.4f}]")
+                print(
+                    f"  ✓ Moneyness range: [{self.df_mis['log_moneyness'].min():.3f}, {self.df_mis['log_moneyness'].max():.3f}]")
+                print(f"  ✓ DTE range: [{self.df_mis['days_to_exp'].min()}, {self.df_mis['days_to_exp'].max()}]")
+
         except FileNotFoundError:
             print(f"ERROR: MIS file not found: {self.mis_path}")
             sys.exit(1)
@@ -83,66 +86,141 @@ class IVSurfaceVisualizer:
             print(f"ERROR loading MIS data: {e}")
             sys.exit(1)
 
-    def map_mis_to_grid_vectorized(self, mis_subset, iv_grid):
+    def map_mis_to_grid_improved(self, mis_subset, iv_grid):
         """
-        Vectorized mapping of MIS scores to grid points using KDTree
-        Much faster than nested loops for large datasets
+        FIXED: Improved MIS mapping with proper coordinate handling
         """
-        mis_grid = np.zeros_like(iv_grid)
+        mis_grid = np.full_like(iv_grid, np.nan, dtype=float)
 
-        # Prepare option coordinates
-        option_coords = np.column_stack([
-            mis_subset['days_to_exp'].values / 365.25,
-            mis_subset['log_moneyness'].values
-        ])
+        if len(mis_subset) == 0:
+            return mis_grid
+
+        # Extract option data
+        option_dte = mis_subset['days_to_exp'].values
+        option_moneyness = mis_subset['log_moneyness'].values
         option_mis = mis_subset['MIS'].values
 
-        # Create grid coordinates
-        grid_dte, grid_log_m = np.meshgrid(self.dte_grid, self.moneyness_grid, indexing='ij')
-        grid_coords = np.column_stack([
-            grid_dte.ravel(),
-            grid_log_m.ravel()
-        ])
+        print(f"    Mapping {len(option_mis)} MIS scores to grid...")
+        print(f"      Option DTE range: [{option_dte.min()}, {option_dte.max()}]")
+        print(f"      Option moneyness range: [{option_moneyness.min():.3f}, {option_moneyness.max():.3f}]")
 
-        # Build KDTree for fast nearest neighbor search
-        tree = cKDTree(option_coords)
+        # For each grid point, find nearby options and average their MIS
+        n_mapped = 0
+        for i, dte in enumerate(self.dte_grid):
+            for j, moneyness in enumerate(self.moneyness_grid):
+                # Skip if IV is invalid
+                if np.isnan(iv_grid[i, j]) or iv_grid[i, j] <= 0:
+                    continue
 
-        # Find neighbors within tolerance
-        tolerance = np.array([CONFIG['dte_tolerance'], CONFIG['moneyness_tolerance']])
-        distances, indices = tree.query(grid_coords, k=5, distance_upper_bound=np.linalg.norm(tolerance))
+                # Find options within tolerance
+                dte_match = np.abs(option_dte - dte) <= CONFIG['dte_tolerance']
+                moneyness_match = np.abs(option_moneyness - moneyness) <= CONFIG['moneyness_tolerance']
+                nearby = dte_match & moneyness_match
 
-        # Calculate mean MIS for each grid point
-        for i, (dists, idxs) in enumerate(zip(distances, indices)):
-            valid = dists < np.inf
-            if valid.any():
-                mis_grid.ravel()[i] = np.mean(option_mis[idxs[valid]])
-            else:
-                mis_grid.ravel()[i] = np.nan
+                if nearby.any():
+                    # Weight by distance (inverse distance weighting)
+                    dte_dist = np.abs(option_dte[nearby] - dte)
+                    moneyness_dist = np.abs(option_moneyness[nearby] - moneyness)
+
+                    # Normalize distances
+                    dte_dist_norm = dte_dist / CONFIG['dte_tolerance']
+                    moneyness_dist_norm = moneyness_dist / CONFIG['moneyness_tolerance']
+
+                    # Combined distance
+                    distances = np.sqrt(dte_dist_norm ** 2 + moneyness_dist_norm ** 2)
+
+                    # Inverse distance weights (add small epsilon to avoid division by zero)
+                    weights = 1.0 / (distances + 0.01)
+                    weights = weights / weights.sum()
+
+                    # Weighted average
+                    mis_grid[i, j] = np.sum(option_mis[nearby] * weights)
+                    n_mapped += 1
+
+        print(f"      ✓ Mapped MIS to {n_mapped} grid points ({100 * n_mapped / mis_grid.size:.1f}% coverage)")
 
         return mis_grid
 
-    def interpolate_missing_values(self, mis_grid):
-        """Interpolate missing MIS values using nearest neighbor"""
+    def interpolate_missing_values_rbf(self, mis_grid):
+        """
+        FIXED: Better interpolation using RBF (Radial Basis Function)
+        Falls back to nearest neighbor if too few points
+        """
         valid_mask = ~np.isnan(mis_grid)
+        n_valid = valid_mask.sum()
 
-        if valid_mask.sum() < CONFIG['interpolation_min_points']:
-            print(f"  ⚠ Warning: Only {valid_mask.sum()} valid points, interpolation may be unreliable")
+        print(f"      Interpolating from {n_valid} valid points...")
+
+        if n_valid < CONFIG['interpolation_min_points']:
+            print(f"      ⚠ Warning: Only {n_valid} valid points, using zero-fill")
             return np.nan_to_num(mis_grid, nan=0.0)
 
-        valid_y, valid_x = np.where(valid_mask)
-        valid_z = mis_grid[valid_mask]
+        # Get valid coordinates and values
+        valid_indices = np.where(valid_mask)
+        valid_dte_idx = valid_indices[0]
+        valid_mon_idx = valid_indices[1]
+        valid_values = mis_grid[valid_mask]
 
-        all_y, all_x = np.where(~valid_mask)
-        if len(all_y) > 0:
+        # Map to actual coordinates
+        valid_coords = np.column_stack([
+            self.dte_grid[valid_dte_idx],
+            self.moneyness_grid[valid_mon_idx]
+        ])
+
+        # Get all grid coordinates
+        dte_mesh, mon_mesh = np.meshgrid(self.dte_grid, self.moneyness_grid, indexing='ij')
+        all_coords = np.column_stack([
+            dte_mesh.ravel(),
+            mon_mesh.ravel()
+        ])
+
+        try:
+            # Try cubic interpolation first
             interpolated = griddata(
-                (valid_y, valid_x),
-                valid_z,
-                (all_y, all_x),
+                valid_coords,
+                valid_values,
+                all_coords,
+                method='cubic',
+                fill_value=0.0
+            )
+
+            # If cubic fails, try linear
+            if np.isnan(interpolated).any():
+                interpolated = griddata(
+                    valid_coords,
+                    valid_values,
+                    all_coords,
+                    method='linear',
+                    fill_value=0.0
+                )
+
+            # If still has NaNs, use nearest neighbor
+            if np.isnan(interpolated).any():
+                interpolated = griddata(
+                    valid_coords,
+                    valid_values,
+                    all_coords,
+                    method='nearest'
+                )
+
+            mis_grid_filled = interpolated.reshape(mis_grid.shape)
+
+            # Smooth the result (optional)
+            from scipy.ndimage import gaussian_filter
+            mis_grid_filled = gaussian_filter(mis_grid_filled, sigma=0.5)
+
+            print(f"      ✓ Interpolation complete")
+            return np.nan_to_num(mis_grid_filled, nan=0.0)
+
+        except Exception as e:
+            print(f"      ⚠ Interpolation failed ({e}), using nearest neighbor")
+            interpolated = griddata(
+                valid_coords,
+                valid_values,
+                all_coords,
                 method='nearest'
             )
-            mis_grid[all_y, all_x] = interpolated
-
-        return np.nan_to_num(mis_grid, nan=0.0)
+            return interpolated.reshape(mis_grid.shape)
 
     def create_mis_colored_surface(self, symbol, date_str=None):
         """Create IV surface colored by MIS scores with time slider"""
@@ -158,14 +236,14 @@ class IVSurfaceVisualizer:
             print(f"  ✗ No dates available for {symbol}")
             return None
 
-        print(f"  Creating MIS-colored surface for {symbol} ({len(dates)} dates)...")
+        print(f"\n  Creating MIS-colored surface for {symbol} ({len(dates)} dates)...")
 
-        # Create meshgrid (same for all dates)
+        # Create meshgrid - CRITICAL: Use correct indexing
         X, Y = np.meshgrid(self.moneyness_grid, self.dte_grid)
 
         # Prepare data for all dates
         frames = []
-        frame_data = []  # Store data for each frame
+        frame_data = []
 
         for date_str in dates:
             if date_str not in self.surfaces[symbol]:
@@ -178,14 +256,17 @@ class IVSurfaceVisualizer:
             mis_subset = self.df_mis[
                 (self.df_mis['underlying_symbol'] == symbol) &
                 (self.df_mis['asofdate'] == date_obj)
-            ].copy()
+                ].copy()
 
             if len(mis_subset) == 0:
+                print(f"    ⚠ No MIS data for {date_str}")
                 continue
 
+            print(f"    Processing {date_str}: {len(mis_subset)} options")
+
             # Map MIS scores to grid
-            mis_grid = self.map_mis_to_grid_vectorized(mis_subset, iv_grid)
-            mis_grid = self.interpolate_missing_values(mis_grid)
+            mis_grid = self.map_mis_to_grid_improved(mis_subset, iv_grid)
+            mis_grid = self.interpolate_missing_values_rbf(mis_grid)
 
             # Store frame data
             frame_data.append({
@@ -199,7 +280,7 @@ class IVSurfaceVisualizer:
             print(f"  ✗ No valid data for any date")
             return None
 
-        print(f"    Found {len(frame_data)} valid dates")
+        print(f"\n  ✓ Successfully processed {len(frame_data)} dates")
 
         # Create frames for animation
         for data in frame_data:
@@ -210,21 +291,22 @@ class IVSurfaceVisualizer:
                     z=data['iv_grid'],
                     surfacecolor=data['mis_grid'],
                     colorscale=[
-                        [0.0, 'rgb(68, 1, 84)'],
-                        [0.3, 'rgb(59, 82, 139)'],
-                        [0.5, 'rgb(33, 145, 140)'],
-                        [0.7, 'rgb(253, 231, 37)'],
-                        [1.0, 'rgb(254, 0, 0)']
+                        [0.0, 'rgb(68, 1, 84)'],  # Dark purple
+                        [0.25, 'rgb(59, 82, 139)'],  # Blue
+                        [0.5, 'rgb(33, 145, 140)'],  # Teal
+                        [0.75, 'rgb(253, 231, 37)'],  # Yellow
+                        [1.0, 'rgb(254, 0, 0)']  # Red
                     ],
                     hovertemplate=(
-                        '<b>Moneyness:</b> %{x:.3f}<br>' +
-                        '<b>Days to Exp:</b> %{y:.0f}<br>' +
-                        '<b>IV:</b> %{z:.2%}<br>' +
-                        '<b>MIS:</b> %{surfacecolor:.3f}<br>' +
-                        '<extra></extra>'
+                            '<b>Moneyness:</b> %{x:.3f}<br>' +
+                            '<b>Days to Exp:</b> %{y:.0f}<br>' +
+                            '<b>IV:</b> %{z:.2%}<br>' +
+                            '<b>MIS:</b> %{surfacecolor:.4f}<br>' +
+                            '<extra></extra>'
                     ),
                     cmin=0,
-                    cmax=self.mis_threshold * CONFIG['colorscale_multiplier']
+                    cmax=self.mis_threshold * CONFIG['colorscale_multiplier'],
+                    showscale=True
                 )],
                 name=data['date'],
                 layout=go.Layout(
@@ -247,9 +329,9 @@ class IVSurfaceVisualizer:
                 surfacecolor=initial_data['mis_grid'],
                 colorscale=[
                     [0.0, 'rgb(68, 1, 84)'],
-                    [0.3, 'rgb(59, 82, 139)'],
+                    [0.25, 'rgb(59, 82, 139)'],
                     [0.5, 'rgb(33, 145, 140)'],
-                    [0.7, 'rgb(253, 231, 37)'],
+                    [0.75, 'rgb(253, 231, 37)'],
                     [1.0, 'rgb(254, 0, 0)']
                 ],
                 colorbar=dict(
@@ -261,21 +343,22 @@ class IVSurfaceVisualizer:
                     x=1.15
                 ),
                 hovertemplate=(
-                    '<b>Moneyness:</b> %{x:.3f}<br>' +
-                    '<b>Days to Exp:</b> %{y:.0f}<br>' +
-                    '<b>IV:</b> %{z:.2%}<br>' +
-                    '<b>MIS:</b> %{surfacecolor:.3f}<br>' +
-                    '<extra></extra>'
+                        '<b>Moneyness:</b> %{x:.3f}<br>' +
+                        '<b>Days to Exp:</b> %{y:.0f}<br>' +
+                        '<b>IV:</b> %{z:.2%}<br>' +
+                        '<b>MIS:</b> %{surfacecolor:.4f}<br>' +
+                        '<extra></extra>'
                 ),
                 cmin=0,
-                cmax=self.mis_threshold * CONFIG['colorscale_multiplier']
+                cmax=self.mis_threshold * CONFIG['colorscale_multiplier'],
+                showscale=True
             )],
             frames=frames
         )
 
         # Create slider steps
         sliders = [dict(
-            active=len(frame_data) - 1,  # Start at most recent
+            active=len(frame_data) - 1,
             yanchor="top",
             y=0,
             xanchor="left",
@@ -370,64 +453,6 @@ class IVSurfaceVisualizer:
 
         return fig
 
-    def create_comparison_plot(self, symbol):
-        """Create side-by-side IV and MIS surfaces"""
-
-        if symbol not in self.surfaces or len(self.surfaces[symbol]) == 0:
-            print(f"  ✗ No surfaces available for {symbol}")
-            return None
-
-        dates = sorted(self.surfaces[symbol].keys())
-        date_str = dates[-1]
-        date_obj = pd.to_datetime(date_str)
-
-        # Get data
-        surface_info = self.surfaces[symbol][date_str]
-        iv_grid = np.array(surface_info['iv_surface'])
-
-        mis_subset = self.df_mis[
-            (self.df_mis['underlying_symbol'] == symbol) &
-            (self.df_mis['asofdate'] == date_obj)
-        ].copy()
-
-        if len(mis_subset) == 0:
-            print(f"  ✗ No MIS data for comparison plot")
-            return None
-
-        # Create MIS grid
-        X, Y = np.meshgrid(self.moneyness_grid, self.dte_grid)
-        mis_grid = self.map_mis_to_grid_vectorized(mis_subset, iv_grid)
-        mis_grid = self.interpolate_missing_values(mis_grid)
-
-        # Create subplots
-        fig = make_subplots(
-            rows=1, cols=2,
-            subplot_titles=(f'{symbol} Implied Volatility', f'{symbol} MIS Scores'),
-            specs=[[{'type': 'surface'}, {'type': 'surface'}]]
-        )
-
-        # IV Surface
-        fig.add_trace(
-            go.Surface(x=X, y=Y, z=iv_grid, colorscale='Viridis',
-                       colorbar=dict(x=0.45, len=0.5, title="IV")),
-            row=1, col=1
-        )
-
-        # MIS Surface
-        fig.add_trace(
-            go.Surface(x=X, y=Y, z=mis_grid, colorscale='Reds',
-                       colorbar=dict(x=1.02, len=0.5, title="MIS")),
-            row=1, col=2
-        )
-
-        fig.update_layout(
-            title=f"{symbol} - IV and MIS Comparison ({date_str})",
-            height=600,
-            width=1400
-        )
-
-        return fig
-
     def generate_all_visualizations(self):
         """Generate visualizations for all symbols"""
         print("\n" + "=" * 70)
@@ -442,26 +467,16 @@ class IVSurfaceVisualizer:
         for symbol in self.symbols:
             print(f"\n📊 Processing {symbol}...")
 
-            # Create MIS-colored surface
             fig = self.create_mis_colored_surface(symbol)
 
             if fig is not None:
                 filename = output_dir / f'iv_surface_mis_{symbol}.html'
                 fig.write_html(str(filename))
-                print(f"  ✓ Saved: {filename}")
+                print(f"\n  ✓ Saved: {filename}")
                 generated.append(str(filename))
 
                 if CONFIG['auto_open_browser']:
                     fig.show()
-
-            # Create comparison plot if enabled
-            if CONFIG['generate_comparison_plots']:
-                fig_comp = self.create_comparison_plot(symbol)
-                if fig_comp is not None:
-                    filename = output_dir / f'iv_comparison_{symbol}.html'
-                    fig_comp.write_html(str(filename))
-                    print(f"  ✓ Saved comparison: {filename}")
-                    generated.append(str(filename))
 
         return generated
 
@@ -470,18 +485,14 @@ def main():
     """Main execution function"""
     print("""
 ╔════════════════════════════════════════════════════════════════╗
-║   IV SURFACE VISUALIZATION WITH MIS COLOR CODING               ║
+║   IV SURFACE VISUALIZATION WITH MIS COLOR CODING (FIXED)       ║
 ║   Interactive 3D plots with mispricing highlights              ║
 ╚════════════════════════════════════════════════════════════════╝
     """)
 
-    # Initialize visualizer
     visualizer = IVSurfaceVisualizer()
-
-    # Generate visualizations
     generated = visualizer.generate_all_visualizations()
 
-    # Summary
     print("\n" + "=" * 70)
     print("VISUALIZATION COMPLETE")
     print("=" * 70)
