@@ -231,6 +231,7 @@ class HJBSolver:
         """
         J = np.zeros(self.n_S)
 
+
         for i in range(self.n_S):
             jump_contrib = 0.0
             total_weight = 0.0
