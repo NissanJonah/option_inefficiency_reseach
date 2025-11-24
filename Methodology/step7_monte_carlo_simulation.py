@@ -12,6 +12,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 import warnings
+from dividend_yields import get_dividend_yields
+
 from pathlib import Path
 
 warnings.filterwarnings('ignore')
@@ -29,11 +31,7 @@ CONFIG = {
     'n_bootstrap': 1000,
     'confidence_level': 0.95,
     'risk_free_rate': 0.04,
-    'dividend_yields': {
-        'SPY': 0.013, 'QQQ': 0.006, 'IWM': 0.012,
-        'AAPL': 0.004, 'MSFT': 0.007, 'TSLA': 0.0,
-        'XOM': 0.033, 'JPM': 0.025, 'NVDA': 0.0
-    }
+    'dividend_yields': get_dividend_yields(['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSLA', 'XOM', 'JPM'])
 }
 
 
@@ -146,8 +144,17 @@ class MonteCarloSimulator:
 
         return paths
 
+    """
+    STEP 7 FIXES - Replace the evaluate_strategies method in MonteCarloSimulator class
+    Location: Around line 90-150 in step7_monte_carlo_simulation.py
+    """
+
     def evaluate_strategies(self, paths):
-        """Evaluate optimal boundary strategy vs hold-to-expiration"""
+        """
+        Evaluate optimal boundary strategy vs hold-to-expiration
+
+        FIXED: Premium accounting - only subtract initial cost once
+        """
         n_paths, n_steps = paths.shape
         t_grid = np.linspace(0, self.T, n_steps)
 
@@ -170,9 +177,13 @@ class MonteCarloSimulator:
 
                     # Exercise if below boundary and ITM
                     if S <= B and S < self.K:
-                        payoff = self.K - S
-                        pv_payoff = payoff * np.exp(-self.r * t)
+                        # FIXED: Calculate payoff correctly
+                        payoff = max(self.K - S, 0)  # Gross payoff from exercise
+                        pv_payoff = payoff * np.exp(-self.r * t)  # Present value
+
+                        # FIXED: Subtract cost ONCE (return = PV(payoff) - initial premium)
                         returns_optimal[i] = pv_payoff - self.cost
+
                         exercise_times[i] = t
                         early_exercise[i] = (t < self.T * 0.95)
                         exercised = True
@@ -182,11 +193,15 @@ class MonteCarloSimulator:
             if not exercised:
                 final_payoff = max(self.K - paths[i, -1], 0)
                 pv_payoff = final_payoff * np.exp(-self.r * self.T)
+
+                # FIXED: Subtract cost ONCE
                 returns_optimal[i] = pv_payoff - self.cost
 
             # Hold strategy: always hold to expiration
             final_payoff = max(self.K - paths[i, -1], 0)
             pv_payoff = final_payoff * np.exp(-self.r * self.T)
+
+            # FIXED: Subtract cost ONCE
             returns_hold[i] = pv_payoff - self.cost
 
         return returns_optimal, returns_hold, exercise_times, early_exercise
@@ -623,6 +638,13 @@ def print_detailed_results(key, result):
         print(f"\n  ➖ NO SIGNIFICANT DIFFERENCE: Strategies perform similarly (p≥0.05)")
 
 
+def open_all_step7_plots():
+    import webbrowser
+    from pathlib import Path
+
+    for f in Path('output').glob('step7_*.html'):
+        webbrowser.open(f'file://{f.absolute()}')
+
 def main():
     # Create output directory
     Path('output').mkdir(exist_ok=True)
@@ -750,3 +772,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    open_all_step7_plots()

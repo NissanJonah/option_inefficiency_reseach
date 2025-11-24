@@ -204,7 +204,7 @@ class RegimeDetector:
             symbol_data = symbol_data.sort_values('asofdate')
 
             # Calculate realized volatility with minimum periods check
-            min_periods = max(10, window_length // 3)  # More robust minimum
+            min_periods = max(20, window_length // 2)  # More robust minimum
 
             symbol_data['realized_vol'] = symbol_data['log_return'].rolling(
                 window=window_length, min_periods=min_periods

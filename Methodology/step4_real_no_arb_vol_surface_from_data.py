@@ -30,7 +30,6 @@ DIVIDEND_YIELDS = get_dividend_yields(['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSL
 OUTPUT_FILE = "iv_surfaces_arbitrage_free.pkl"
 MONEYNESS_GRID = np.linspace(-0.5, 0.5, 101)
 DTE_GRID = np.array([1, 3, 7, 14, 21, 30, 45, 60, 90, 120, 150, 180, 252, 365])
-MIN_QUOTES_PER_DAY = 80
 SYMBOLS = ['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSLA', 'XOM', 'JPM']
 
 
@@ -113,7 +112,9 @@ def implied_volatility_from_price_vectorized(price, S, K, T, r, q, is_call):
     intrinsic = np.where(is_call_v, call_intrinsic, put_intrinsic)
 
     # Second filter: price must be above intrinsic
-    above_intrinsic = price_v >= intrinsic * 0.99
+    ARBITRAGE_TOLERANCE = 0.01
+    above_intrinsic = price_v >= intrinsic * (1 - ARBITRAGE_TOLERANCE)
+    #We allow 1% tolerance below intrinsic value to account for bid-ask bounce and discrete pricing
 
     if not np.any(above_intrinsic):
         return iv
@@ -213,6 +214,8 @@ conn.close()  # Close after filtering
 
 after_count = len(df)
 print(f"\n✓ After standardized filtering: {after_count:,} quotes ({100*after_count/initial_count:.1f}% retained)")
+
+
 
 # ================================
 # 2. DOWNLOAD RISK-FREE RATES
@@ -523,8 +526,7 @@ for symbol in SYMBOLS:
     for asofdate in dates:
         day_data = sym_data[sym_data['asofdate'] == asofdate]
 
-        if len(day_data) < MIN_QUOTES_PER_DAY:
-            continue
+
 
         grid = build_iv_surface_for_day(day_data)
 

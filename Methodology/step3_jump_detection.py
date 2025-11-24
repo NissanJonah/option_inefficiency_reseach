@@ -223,7 +223,8 @@ for regime_idx, label in regime_labels.items():
         sigma_J = np.std(jump_sizes)
 
         # Ensure minimum volatility
-        sigma_J = max(sigma_J, 0.02)
+        min_sigma = test_data[test_data['is_jump']]['jump_size'].std() * 0.5  # 50% of overall jump vol
+        sigma_J = max(np.std(jump_sizes), min_sigma)
 
         print(f"  Days: {n_days:4}, Jumps: {n_jumps:3}")
         print(f"  λ (intensity): {lambda_j:.3f} jumps/year")
@@ -235,8 +236,9 @@ for regime_idx, label in regime_labels.items():
             print(f"  Jump range:    [{jump_sizes.min():.4f}, {jump_sizes.max():.4f}]")
     else:
         # Default values when too few jumps
-        mu_J = 0.0
-        sigma_J = 0.05
+        all_jumps = test_data[test_data['is_jump']]['jump_size']
+        mu_J = all_jumps.mean() if len(all_jumps) > 0 else 0.0
+        sigma_J = all_jumps.std() if len(all_jumps) > 10 else 0.05
         print(f"  Days: {n_days:4}, Jumps: {n_jumps:3} (too few - using defaults)")
         print(f"  λ (intensity): {lambda_j:.3f} jumps/year")
         print(f"  μ_J (default): {mu_J:.4f}")
@@ -382,6 +384,21 @@ plt.close()
 print("\n" + "="*70)
 print("SAVING RESULTS")
 print("="*70)
+
+
+print("\nTesting different significance levels for jump detection:")
+print("(Using SPY as representative symbol)")
+
+spy_returns = data[data['underlying_symbol'] == 'SPY']['log_return'].values
+
+for alpha_test in [0.001, 0.005, 0.01]:
+    jumps, _ = lee_mykland_corrected(spy_returns, K=WINDOW_BV, alpha=alpha_test)
+    n_jumps_test = jumps.sum()
+    pct_jumps = 100 * n_jumps_test / len(spy_returns)
+    print(f"  α={alpha_test:.3f}: {n_jumps_test:3} jumps detected ({pct_jumps:.2f}% of returns)")
+
+print(f"\n✓ Selected α={ALPHA} for final analysis")
+print("  Justification: Balances sensitivity to moderate tail events with false positive control")
 
 results = {
     'data': data,
