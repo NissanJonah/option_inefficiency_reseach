@@ -76,7 +76,7 @@ print("\n" + "="*70)
 print("LOADING PRICE HISTORY")
 print("="*70)
 
-prices = download_underlying_prices_yfinance('2010-01-01', None, SYMBOLS)
+prices = download_underlying_prices_yfinance('2016-01-01', None, SYMBOLS)
 print(f"✓ Downloaded {len(prices):,} price observations")
 print(f"  Date range: {prices['asofdate'].min().date()} → {prices['asofdate'].max().date()}")
 
@@ -139,7 +139,7 @@ def lee_mykland_corrected(returns, K=22, alpha=0.001):
     # Critical value from Gumbel distribution
     # Critical value from Gumbel distribution
     # Use effective sample size (cap at 5 years) to prevent threshold from growing too large
-    n_effective = min(n, 252 * 5)  # Cap at 5 years of trading days
+    n_effective = n  # Use full sample for threshold
     c_n = np.sqrt(2 * np.log(n_effective))
     beta = -np.log(-np.log(1 - alpha))
     threshold = c_n - (np.log(np.pi) + np.log(np.log(n_effective))) / (2 * c_n) + beta / c_n
@@ -229,11 +229,9 @@ print("REGIME-SPECIFIC JUMP PARAMETERS")
 print("="*70)
 
 jump_params_by_regime = {}
-
-for regime_idx, label in regime_labels.items():
+for regime_idx in regime_labels.keys():
     print(f"\n{label}:")
-
-    regime_data = test_data[test_data['regime'] == regime_idx]
+    regime_data = train_data[train_data['regime'] == regime_idx]  # ← TRAIN only
     regime_jumps = regime_data[regime_data['is_jump']]
 
     n_days = len(regime_data)
@@ -300,98 +298,109 @@ for sym in SYMBOLS:
     symbol_regime_jumps[sym] = {}
 
     print(f"\n{'=' * 70}")
-    print(f"{sym} - SYMBOL-LEVEL POOLED PARAMETERS:")
+    print(f"{sym} - TRAINING PERIOD PARAMETERS")
     print(f"{'=' * 70}")
 
-    # Calculate symbol-level pooled parameters FIRST
-    symbol_all_data = test_data[test_data['underlying_symbol'] == sym]
-    symbol_all_jumps = symbol_all_data[symbol_all_data['is_jump']]
-    symbol_total_days = len(symbol_all_data)
+    # Calculate symbol-level pooled parameters from TRAINING data only
+    symbol_train_data = train_data[train_data['underlying_symbol'] == sym]  # ← TRAIN
+    symbol_train_jumps = symbol_train_data[symbol_train_data['is_jump']]
+    symbol_train_days = len(symbol_train_data)
 
-    print(f"  Total test days for {sym}: {symbol_total_days}")
-    print(f"  Total jumps for {sym}: {len(symbol_all_jumps)}")
+    print(f"  Total TRAINING days for {sym}: {symbol_train_days}")
+    print(f"  Total TRAINING jumps for {sym}: {len(symbol_train_jumps)}")
 
-    if len(symbol_all_jumps) >= 3:  # Enough symbol-level data
-        symbol_mu_J = symbol_all_jumps['jump_size'].mean()
-        symbol_sigma_J = symbol_all_jumps['jump_size'].std()
-        symbol_lambda_j = len(symbol_all_jumps) / symbol_total_days * 252
-        print(f"  → Using symbol-specific pooled params: λ={symbol_lambda_j:.3f}/yr")
+    if len(symbol_train_jumps) >= 3:
+        symbol_mu_J = symbol_train_jumps['jump_size'].mean()
+        symbol_sigma_J = symbol_train_jumps['jump_size'].std()
+        symbol_lambda_j = len(symbol_train_jumps) / symbol_train_days * 252
+        print(f"  → Symbol-pooled params: λ={symbol_lambda_j:.3f}/yr")
     else:
-        # Use overall test data as fallback
-        symbol_mu_J = test_data[test_data['is_jump']]['jump_size'].mean()
-        symbol_sigma_J = test_data[test_data['is_jump']]['jump_size'].std()
-        symbol_lambda_j = len(test_data[test_data['is_jump']]) / len(test_data) * 252
-        print(f"  → Using global fallback params: λ={symbol_lambda_j:.3f}/yr")
+        # Fallback to all symbols pooled (training only)
+        all_train_jumps = train_data[train_data['is_jump']]['jump_size']  # ← TRAIN
+        symbol_mu_J = all_train_jumps.mean()
+        symbol_sigma_J = all_train_jumps.std()
+        symbol_lambda_j = len(train_data[train_data['is_jump']]) / len(train_data) * 252
+        print(f"  → Global fallback params: λ={symbol_lambda_j:.3f}/yr")
 
     print(f"\nRegime-by-regime breakdown:")
 
     for regime_idx, label in regime_labels.items():
-        regime_data = test_data[
-            (test_data['underlying_symbol'] == sym) &
-            (test_data['regime'] == regime_idx)
-            ]
+        # ✅ CRITICAL FIX: Filter by BOTH symbol AND training period
+        regime_data = train_data[
+            (train_data['underlying_symbol'] == sym) &
+            (train_data['regime'] == regime_idx)
+        ]
         regime_jumps = regime_data[regime_data['is_jump']]
 
         n_jumps = len(regime_jumps)
         n_days = len(regime_data)
 
-        debug_stats['total_calculations'] += 1
-
         print(f"\n  {label}:")
-        print(f"    Days in regime: {n_days}")
-        print(f"    Jumps in regime: {n_jumps}")
+        print(f"    TRAINING days in regime: {n_days}")
+        print(f"    TRAINING jumps in regime: {n_jumps}")
 
         if n_days > 0:
             raw_lambda = (n_jumps / n_days * 252)
-            print(f"    Raw λ calculation: {n_jumps}/{n_days} × 252 = {raw_lambda:.3f}")
+            print(f"    Raw λ: {n_jumps}/{n_days} × 252 = {raw_lambda:.3f}")
         else:
             raw_lambda = 0.0
-            print(f"    Raw λ calculation: N/A (no days)")
+            print(f"    Raw λ: N/A (no training days in this regime)")
 
-        # Decision logic with full transparency
+        # Use regime-specific if enough data, else use symbol pooled
         if n_days >= 50 and n_jumps >= 2:
-            # Enough regime-specific data - use it
             jump_sizes = regime_jumps['jump_size'].values
             mu_J = np.mean(jump_sizes)
             sigma_J = max(np.std(jump_sizes), 0.02)
             lambda_j = raw_lambda
             data_source = "REGIME-SPECIFIC"
-            debug_stats['regime_specific_used'] += 1
-            print(f"    ✓ Using REGIME-SPECIFIC parameters")
+            print(f"    ✓ Using REGIME-SPECIFIC")
         else:
-            # Use symbol-level pooled parameters
             mu_J = symbol_mu_J
             sigma_J = symbol_sigma_J
             lambda_j = symbol_lambda_j
             data_source = "SYMBOL-POOLED"
-            debug_stats['symbol_pooled_used'] += 1
-            print(f"    ✓ Using SYMBOL-POOLED parameters (insufficient regime data)")
-            print(f"       Reason: n_days={n_days} (<10) or n_jumps={n_jumps} (<3)")
+            print(f"    ✓ Using SYMBOL-POOLED (insufficient data)")
 
-        # Track lambda values
-        debug_stats['all_lambdas'].append(lambda_j)
-        if lambda_j > 20:
-            debug_stats['lambdas_over_20'].append((sym, label, lambda_j, n_jumps, n_days))
-        if lambda_j > 50:
-            debug_stats['lambdas_over_50'].append((sym, label, lambda_j, n_jumps, n_days))
-
-        # REMOVED BAD CAPPING LOGIC - just report the actual value
         print(f"    Final λ = {lambda_j:.3f} jumps/year")
-
-        if lambda_j > 20:
-            print(f"    ⚠️  WARNING: High jump intensity detected!")
-            if n_days < 50:
-                print(f"       This may be due to small sample size (only {n_days} days)")
 
         symbol_regime_jumps[sym][regime_idx] = {
             'mu_J': mu_J,
             'sigma_J': sigma_J,
-            'lambda_j': lambda_j,  # NO CAPPING
+            'lambda_j': lambda_j,
             'n_jumps': n_jumps,
             'n_days': n_days,
             'data_source': data_source
         }
 
+    n_jumps = len(regime_jumps)
+    n_days = len(regime_data)
+
+    # ADD THESE LINES BACK:
+    debug_stats['total_calculations'] += 1  # ← Missing!
+
+    print(f"\n  {label}:")
+    print(f"    TRAINING days in regime: {n_days}")
+    print(f"    TRAINING jumps in regime: {n_jumps}")
+
+    # ... calculation of lambda_j ...
+
+    if n_days >= 50 and n_jumps >= 2:
+        # ...
+        debug_stats['regime_specific_used'] += 1  # ← Missing!
+    else:
+        # ...
+        debug_stats['symbol_pooled_used'] += 1  # ← Missing!
+
+    print(f"    Final λ = {lambda_j:.3f} jumps/year")
+
+    # ADD THIS LINE:
+    debug_stats['all_lambdas'].append(lambda_j)  # ← Missing!
+
+    # Track high lambdas
+    if lambda_j > 20:
+        debug_stats['lambdas_over_20'].append((sym, label, lambda_j, n_jumps, n_days))
+    if lambda_j > 50:
+        debug_stats['lambdas_over_50'].append((sym, label, lambda_j, n_jumps, n_days))
 # ================================
 # DEBUG SUMMARY
 # ================================
@@ -425,7 +434,25 @@ if debug_stats['lambdas_over_50']:
         print(f"    {sym:6} {label:18} λ={lam:6.2f}  ({n_j:2} jumps / {n_d:3} days = {jump_rate_pct:.1f}%)")
         print(f"           → Is this realistic? Consider if detection is too sensitive.")
 
+# Verify no look-ahead bias
 print("\n" + "=" * 70)
+print("LOOK-AHEAD BIAS VERIFICATION")
+print("=" * 70)
+
+for sym in SYMBOLS:
+    total_regime_days = sum(
+        symbol_regime_jumps[sym][r]['n_days']
+        for r in regime_labels.keys()
+    )
+    expected_days = len(train_data[train_data['underlying_symbol'] == sym])
+
+    print(f"{sym}: Regime days = {total_regime_days}, Expected = {expected_days}")
+
+    if total_regime_days > expected_days * 1.05:
+        print(f"  ❌ ERROR: Using more than training data!")
+    elif abs(total_regime_days - expected_days) / expected_days < 0.05:
+        print(f"  ✅ PASS")
+
 # ================================
 # 8. VISUALIZATION
 # ================================

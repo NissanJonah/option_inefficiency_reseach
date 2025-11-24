@@ -1,596 +1,513 @@
 """
-STEP 4: ARBITRAGE-FREE IV SURFACE CONSTRUCTION - CORRECTED
-
-
-
-Key fixes:
-1. Use step1_redone_filtering for data preparation
-2. Apply filters BEFORE Black-Scholes pricing
-3. Use Yahoo Finance for risk-free rates (database doesn't have this)
+FIXED: VISUALIZE IMPLIED VOLATILITY SURFACES WITH MIS COLOR CODING
+Corrects coordinate system and interpolation issues
 """
 
-import pandas as pd
-import numpy as np
 import pickle
-from scipy.interpolate import PchipInterpolator, interp1d
-from scipy.stats import norm
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime
-import yfinance as yf
-import warnings
-
-warnings.filterwarnings("ignore")
-
-from step1_redone_filtering import OptionsDataFilter
-from dividend_yields import get_dividend_yields
-from step2_hmm_regime_detection import connect_to_db
-from psycopg2.extras import RealDictCursor
-DIVIDEND_YIELDS = get_dividend_yields(['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'XOM', 'JPM'])
+from scipy.interpolate import griddata
+from scipy.spatial import cKDTree
+import sys
+from pathlib import Path
 
 # ================================
-# CONFIG
+# CONFIGURATION
 # ================================
-OUTPUT_FILE = "iv_surfaces_arbitrage_free.pkl"
-MONEYNESS_GRID = np.linspace(-0.5, 0.5, 101)
-DTE_GRID = np.array([1, 3, 7, 14, 21, 30, 45, 60, 90, 120, 150, 180, 252, 365])
-SYMBOLS = ['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'XOM', 'JPM']
-
-
-
-# Remove this old block:
-# DIVIDEND_YIELDS = { ... }
-
-# Replace with:
-print("Fetching real dividend yields...")
-DIVIDEND_YIELDS = get_dividend_yields(SYMBOLS)
-
-print("""
-╔════════════════════════════════════════════════════════════════╗
-║   STEP 4: ARBITRAGE-FREE IV SURFACE CONSTRUCTION               ║
-║   Professional Pipeline: IV → Prices → No-Arb → Clean IV      ║
-╚════════════════════════════════════════════════════════════════╝
-""")
-
-# ================================
-# BLACK-SCHOLES FUNCTIONS (VECTORIZED)
-# ================================
-def black_scholes_price_vectorized(S, K, T, r, q, sigma, is_call):
-    """Vectorized Black-Scholes pricing with dividends"""
-    S = np.asarray(S)
-    K = np.asarray(K)
-    T = np.asarray(T)
-    r = np.asarray(r)
-    q = np.asarray(q)
-    sigma = np.asarray(sigma)
-    is_call = np.asarray(is_call)
-
-    prices = np.zeros_like(S, dtype=float)
-    valid = (T > 0) & (sigma > 0) & (S > 0) & (K > 0)
-
-    if not np.any(valid):
-        return prices
-
-    S_v, K_v, T_v = S[valid], K[valid], T[valid]
-    r_v, q_v, sigma_v = r[valid], q[valid], sigma[valid]
-    is_call_v = is_call[valid]
-
-    d1 = (np.log(S_v / K_v) + (r_v - q_v + 0.5 * sigma_v**2) * T_v) / (sigma_v * np.sqrt(T_v))
-    d2 = d1 - sigma_v * np.sqrt(T_v)
-
-    call_prices = S_v * np.exp(-q_v * T_v) * norm.cdf(d1) - K_v * np.exp(-r_v * T_v) * norm.cdf(d2)
-    put_prices = K_v * np.exp(-r_v * T_v) * norm.cdf(-d2) - S_v * np.exp(-q_v * T_v) * norm.cdf(-d1)
-
-    prices[valid] = np.where(is_call_v, call_prices, put_prices)
-    return prices
-
-
-def implied_volatility_from_price_vectorized(price, S, K, T, r, q, is_call):
-    """Vectorized IV calculation using Newton-Raphson - FIXED"""
-    price = np.asarray(price)
-    S = np.asarray(S)
-    K = np.asarray(K)
-    T = np.asarray(T)
-    r = np.asarray(r)
-    q = np.asarray(q)
-    is_call = np.asarray(is_call)
-
-    # Initialize output array
-    iv = np.full_like(price, np.nan, dtype=float)
-
-    # First filter: basic validity
-    valid = (price > 0) & (S > 0) & (K > 0) & (T > 0)
-
-    if not np.any(valid):
-        return iv
-
-    # Extract valid data
-    price_v = price[valid]
-    S_v, K_v, T_v = S[valid], K[valid], T[valid]
-    r_v, q_v = r[valid], q[valid]
-    is_call_v = is_call[valid]
-
-    # Calculate intrinsic values
-    call_intrinsic = np.maximum(S_v * np.exp(-q_v * T_v) - K_v * np.exp(-r_v * T_v), 0)
-    put_intrinsic = np.maximum(K_v * np.exp(-r_v * T_v) - S_v * np.exp(-q_v * T_v), 0)
-    intrinsic = np.where(is_call_v, call_intrinsic, put_intrinsic)
-
-    # Second filter: price must be above intrinsic
-    ARBITRAGE_TOLERANCE = 0.01
-    above_intrinsic = price_v >= intrinsic * (1 - ARBITRAGE_TOLERANCE)
-    #We allow 1% tolerance below intrinsic value to account for bid-ask bounce and discrete pricing
-
-    if not np.any(above_intrinsic):
-        return iv
-
-    # Extract data that passes both filters
-    price_vv = price_v[above_intrinsic]
-    S_vv, K_vv, T_vv = S_v[above_intrinsic], K_v[above_intrinsic], T_v[above_intrinsic]
-    r_vv, q_vv = r_v[above_intrinsic], q_v[above_intrinsic]
-    is_call_vv = is_call_v[above_intrinsic]
-
-    # Initial guess for sigma
-    sigma_guess = np.sqrt(2 * np.pi / T_vv) * (price_vv / S_vv)
-    sigma_guess = np.clip(sigma_guess, 0.01, 3.0)
-
-    sigma = sigma_guess.copy()
-    max_iterations = 20
-    tolerance = 1e-6
-
-    # Newton-Raphson iteration
-    for iteration in range(max_iterations):
-        d1 = (np.log(S_vv / K_vv) + (r_vv - q_vv + 0.5 * sigma ** 2) * T_vv) / (sigma * np.sqrt(T_vv))
-        d2 = d1 - sigma * np.sqrt(T_vv)
-
-        call_price = S_vv * np.exp(-q_vv * T_vv) * norm.cdf(d1) - K_vv * np.exp(-r_vv * T_vv) * norm.cdf(d2)
-        put_price = K_vv * np.exp(-r_vv * T_vv) * norm.cdf(-d2) - S_vv * np.exp(-q_vv * T_vv) * norm.cdf(-d1)
-        model_price = np.where(is_call_vv, call_price, put_price)
-
-        vega = S_vv * np.exp(-q_vv * T_vv) * norm.pdf(d1) * np.sqrt(T_vv)
-        vega = np.maximum(vega, 1e-10)
-
-        diff = model_price - price_vv
-        sigma_new = sigma - diff / vega
-        sigma_new = np.clip(sigma_new, 0.001, 5.0)
-
-        if np.max(np.abs(sigma_new - sigma)) < tolerance:
-            break
-
-        sigma = sigma_new
-
-    # CRITICAL FIX: Use two-step indexing
-    # First, create array for valid indices
-    sigma_valid = np.full(len(price_v), np.nan)
-    # Then assign to positions that passed intrinsic filter
-    sigma_valid[above_intrinsic] = sigma
-    # Finally, assign to original array positions
-    iv[valid] = sigma_valid
-
-    # Clean up invalid values
-    iv[(iv < 0.001) | (iv > 5.0)] = np.nan
-
-    return iv
-
-
-# ================================
-# 1. LOAD AND FILTER OPTIONS DATA
-# ================================
-print("\n" + "="*70)
-print("STEP 1: LOADING & FILTERING OPTIONS DATA")
-print("="*70)
-
-conn = connect_to_db()
-if conn is None:
-    raise SystemExit("DB connection failed")
-
-query = """
-SELECT
-    asofdate,
-    (data->'attributes'->>'underlying_symbol') AS underlying_symbol,
-    (data->'attributes'->>'strike')::float AS strike,
-    (data->'attributes'->>'exp_date') AS exp_date,
-    (data->'attributes'->>'type') AS option_type,
-    (data->'attributes'->>'bid')::float AS bid,
-    (data->'attributes'->>'ask')::float AS ask,
-    (data->'attributes'->>'volatility')::float AS volatility
-FROM options
-WHERE (data->'attributes'->>'underlying_symbol') IN ('SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSLA', 'XOM', 'JPM')
-ORDER BY asofdate, exp_date, strike
-"""
-
-print("Querying database...")
-df_raw = pd.read_sql(query, conn)
-conn.close()
-
-initial_count = len(df_raw)
-print(f"✓ Loaded {initial_count:,} raw option quotes")
-
-# ================================
-# APPLY STANDARDIZED FILTERS
-# ================================
-conn = connect_to_db()  # Reopen connection for filtering
-if conn is None:
-    raise SystemExit("DB connection failed")
-
-filter_obj = OptionsDataFilter(conn, verbose=True)
-df = filter_obj.apply_filters(df_raw)
-conn.close()  # Close after filtering
-
-after_count = len(df)
-print(f"\n✓ After standardized filtering: {after_count:,} quotes ({100*after_count/initial_count:.1f}% retained)")
-
-
-
-# ================================
-# 2. DOWNLOAD RISK-FREE RATES
-# ================================
-print("\n" + "="*70)
-print("STEP 2: DOWNLOADING RISK-FREE RATES")
-print("="*70)
-
-first_date = df['asofdate'].min()
-last_date = df['asofdate'].max()
-
-try:
-    tbill = yf.Ticker("^IRX")
-    rfr_data = tbill.history(start=first_date, end=last_date + pd.Timedelta(days=1), interval="1d")[['Close']]
-    rfr_data = rfr_data.reset_index()
-    rfr_data['asofdate'] = pd.to_datetime(rfr_data['Date']).dt.tz_localize(None).dt.normalize()
-    rfr_data['risk_free_rate'] = rfr_data['Close'] / 100
-    rfr_data = rfr_data[['asofdate', 'risk_free_rate']]
-
-    all_dates = pd.DataFrame({'asofdate': pd.date_range(first_date, last_date, freq='D')})
-    all_dates['asofdate'] = all_dates['asofdate'].dt.tz_localize(None).dt.normalize()
-    rfr_data = all_dates.merge(rfr_data, on='asofdate', how='left')
-    rfr_data['risk_free_rate'] = rfr_data['risk_free_rate'].ffill().bfill()
-
-    print(f"✓ Downloaded risk-free rates: {rfr_data['risk_free_rate'].mean()*100:.2f}% avg")
-except Exception as e:
-    print(f"⚠ Using constant 4.0% rate: {e}")
-    all_dates = pd.DataFrame({'asofdate': pd.date_range(first_date, last_date, freq='D')})
-    all_dates['asofdate'] = all_dates['asofdate'].dt.tz_localize(None).dt.normalize()
-    rfr_data = all_dates
-    rfr_data['risk_free_rate'] = 0.04
-
-# ================================
-# 3. MERGE RATES & ADD FEATURES
-# ================================
-# ================================
-# 3. MERGE RATES & ADD FEATURES
-# ================================
-print("\n" + "="*70)
-print("STEP 3: ADDING RISK-FREE RATES & DIVIDEND YIELDS")
-print("="*70)
-
-# CRITICAL: Ensure all required columns exist
-if 'tte' not in df.columns:
-    print("  Creating tte column...")
-    if 'days_to_exp' not in df.columns:
-        df['exp_date'] = pd.to_datetime(df['exp_date']).dt.tz_localize(None).dt.normalize()
-        df['asofdate'] = pd.to_datetime(df['asofdate']).dt.tz_localize(None).dt.normalize()
-        df['days_to_exp'] = (df['exp_date'] - df['asofdate']).dt.days
-    df['tte'] = df['days_to_exp'] / 365.25
-
-if 'log_moneyness' not in df.columns:
-    print("  Creating log_moneyness column...")
-    df['log_moneyness'] = np.log(df['strike'] / df['underlying_price'])
-
-# Merge rates
-df = df.merge(rfr_data, on='asofdate', how='left')
-df = df.dropna(subset=['risk_free_rate'])
-df['dividend_yield'] = df['underlying_symbol'].map(DIVIDEND_YIELDS)
-
-# Verify required columns exist
-required_cols = ['underlying_price', 'strike', 'tte', 'risk_free_rate',
-                 'dividend_yield', 'volatility', 'log_moneyness']
-missing = [col for col in required_cols if col not in df.columns]
-if missing:
-    raise ValueError(f"❌ Missing required columns: {missing}")
-
-print(f"✓ Merged dataset: {len(df):,} quotes")
-print(f"  Columns verified: {', '.join(required_cols)}")
-
-# ================================
-# 4. CONVERT IVs → SYNTHETIC PRICES
-# ================================
-print("\n" + "="*70)
-print("STEP 4: CONVERTING IMPLIED VOLS → SYNTHETIC PRICES")
-print("="*70)
-
-is_call = (df['option_type'] == 'call').values
-
-df['synthetic_price'] = black_scholes_price_vectorized(
-    S=df['underlying_price'].values,
-    K=df['strike'].values,
-    T=df['tte'].values,
-    r=df['risk_free_rate'].values,
-    q=df['dividend_yield'].values,
-    sigma=df['volatility'].values,
-    is_call=is_call
-)
-
-valid_prices = (df['synthetic_price'] > 0).sum()
-print(f"✓ Generated {valid_prices:,} synthetic prices")
-
-# ================================
-# 5. ENFORCE NO-ARBITRAGE CONSTRAINTS
-# ================================
-print("\n" + "="*70)
-print("STEP 5: ENFORCING NO-ARBITRAGE CONSTRAINTS")
-print("="*70)
-
-# REPLACE enforce_no_arbitrage_optimized with this version:
-
-def enforce_no_arbitrage_optimized(group_data):
-    """Enforce PCP and butterfly constraints - fixed for duplicates"""
-    df_clean = group_data.copy()
-
-    # Put-Call Parity - handle duplicates by averaging first
-    calls = df_clean[df_clean['option_type'] == 'call'].copy()
-    puts = df_clean[df_clean['option_type'] == 'put'].copy()
-
-    if len(calls) > 0 and len(puts) > 0:
-        # Aggregate duplicates before merging
-        call_agg = calls.groupby(['strike', 'exp_date']).agg({
-            'synthetic_price': 'mean',
-            'underlying_price': 'first',
-            'tte': 'first',
-            'risk_free_rate': 'first',
-            'dividend_yield': 'first'
-        }).reset_index()
-
-        put_agg = puts.groupby(['strike', 'exp_date']).agg({
-            'synthetic_price': 'mean'
-        }).reset_index()
-
-        merged = call_agg.merge(
-            put_agg,
-            on=['strike', 'exp_date'],
-            suffixes=('_call', '_put')
-        )
-
-        if len(merged) > 0:
-            S = merged['underlying_price'].values
-            K = merged['strike'].values
-            T = merged['tte'].values
-            r = merged['risk_free_rate'].values
-            q = merged['dividend_yield'].values
-
-            theoretical_diff = S * np.exp(-q * T) - K * np.exp(-r * T)
-            actual_diff = merged['synthetic_price_call'].values - merged['synthetic_price_put'].values
-            deviation = (actual_diff - theoretical_diff) / 2
-
-            # Create lookup dict for corrections
-            corrections = {}
-            for i, row in merged.iterrows():
-                key = (row['strike'], row['exp_date'])
-                corrections[key] = deviation[i]
-
-            # Apply corrections
-            # Apply corrections using vectorized operations
-            for key, deviation in corrections.items():
-                strike, exp = key
-                call_mask = (df_clean['strike'] == strike) & (df_clean['exp_date'] == exp) & (
-                            df_clean['option_type'] == 'call')
-                put_mask = (df_clean['strike'] == strike) & (df_clean['exp_date'] == exp) & (
-                            df_clean['option_type'] == 'put')
-
-                df_clean.loc[call_mask, 'synthetic_price'] -= deviation
-                df_clean.loc[put_mask, 'synthetic_price'] += deviation
-    # Butterfly constraints
-    for opt_type in ['call', 'put']:
-        for exp in df_clean['exp_date'].unique():
-            mask = (df_clean['option_type'] == opt_type) & (df_clean['exp_date'] == exp)
-            type_data = df_clean[mask].sort_values('strike')
-
-            if len(type_data) >= 3:
-                # Average duplicates at same strike
-                strike_prices = type_data.groupby('strike')['synthetic_price'].mean()
-                strikes = strike_prices.index.values
-                prices = strike_prices.values
-
-                if len(strikes) >= 3:
-                    for i in range(1, len(strikes) - 1):
-                        butterfly = prices[i-1] - 2*prices[i] + prices[i+1]
-                        if butterfly < 0:
-                            corrected_mid = (prices[i-1] + prices[i+1]) / 2
-                            # Apply to all options at this strike
-                            strike_mask = mask & (df_clean['strike'] == strikes[i])
-                            df_clean.loc[strike_mask, 'synthetic_price'] = corrected_mid
-
-    return df_clean
-
-cleaned_groups = []
-total_groups = 0
-pcp_corrections = 0
-
-for (symbol, date, exp), group in df.groupby(['underlying_symbol', 'asofdate', 'exp_date']):
-    if len(group) < 3:
-        continue
-
-    original_prices = group['synthetic_price'].values.copy()
-    cleaned = enforce_no_arbitrage_optimized(group)
-
-    if not np.allclose(original_prices, cleaned['synthetic_price'].values, rtol=0.01):
-        pcp_corrections += 1
-
-    cleaned_groups.append(cleaned)
-    total_groups += 1
-
-df_clean = pd.concat(cleaned_groups, ignore_index=True)
-
-print(f"✓ Processed {total_groups} groups, {pcp_corrections} corrections made")
-
-# ================================
-# 6. CONVERT CLEAN PRICES → CLEAN IVs
-# ================================
-print("\n" + "="*70)
-print("STEP 6: CONVERTING CLEAN PRICES → CLEAN IVs")
-print("="*70)
-
-is_call_clean = (df_clean['option_type'] == 'call').values
-
-df_clean['clean_iv'] = implied_volatility_from_price_vectorized(
-    price=df_clean['synthetic_price'].values,
-    S=df_clean['underlying_price'].values,
-    K=df_clean['strike'].values,
-    T=df_clean['tte'].values,
-    r=df_clean['risk_free_rate'].values,
-    q=df_clean['dividend_yield'].values,
-    is_call=is_call_clean
-)
-
-valid_before = len(df_clean)
-df_clean = df_clean[df_clean['clean_iv'].notna()]
-df_clean = df_clean[(df_clean['clean_iv'] > 0.01) & (df_clean['clean_iv'] < 3.0)]
-valid_after = len(df_clean)
-
-print(f"✓ Generated {valid_after:,} clean IVs")
-
-# ================================
-# 7. BUILD IV SURFACES
-# ================================
-print("\n" + "="*70)
-print("STEP 7: BUILDING SMOOTH IV SURFACES")
-print("="*70)
-
-def build_iv_surface_for_day(day_data):
-    """Build smooth IV surface for a single day"""
-    surfaces = []
-
-    for tte, group in day_data.groupby('tte'):
-        group = group.copy()
-        group['log_moneyness_rounded'] = group['log_moneyness'].round(6)
-
-        agg_group = group.groupby('log_moneyness_rounded').agg({
-            'log_moneyness': 'mean',
-            'clean_iv': 'mean'
-        }).reset_index(drop=True)
-
-        x = agg_group['log_moneyness'].values
-        v = agg_group['clean_iv'].values ** 2 * tte
-
-        idx = np.argsort(x)
-        x, v = x[idx], v[idx]
-
-        mask = np.concatenate([[True], np.diff(x) > 0])
-        x, v = x[mask], v[mask]
-
-        if len(x) < 3:
-            continue
-
-        try:
-            spl = PchipInterpolator(x, v, extrapolate=False)
-            var_interp = spl(MONEYNESS_GRID)
-            var_interp = np.maximum(var_interp, 0)
-            iv_interp = np.sqrt(np.maximum(var_interp / tte, 0))
-            surfaces.append((tte, iv_interp))
-        except:
-            continue
-
-    if not surfaces:
-        return None
-
-    surfaces = sorted(surfaces, key=lambda x: x[0])
-    ttes, iv_rows = zip(*surfaces)
-
-    grid_final = np.empty((len(DTE_GRID), len(MONEYNESS_GRID)))
-    grid_final[:] = np.nan
-
-    tte_grid_years = DTE_GRID / 365.25
-
-    for j in range(len(MONEYNESS_GRID)):
-        # Collect total variance for this moneyness across all available T
-        total_variance = []
-        available_tte = []
-
-        for i, (t, iv_row) in enumerate(zip(ttes, iv_rows)):
-            if not np.isnan(iv_row[j]):
-                total_variance.append(iv_row[j] ** 2 * t)
-                available_tte.append(t)
-
-        if len(total_variance) < 2:
-            continue
-
-        # Sort by maturity
-        idx = np.argsort(available_tte)
-        available_tte = np.array(available_tte)[idx]
-        total_variance = np.array(total_variance)[idx]
-
-        # ENFORCE MONOTONICITY: total variance must be non-decreasing
-        total_variance = np.maximum.accumulate(total_variance)
-
-        # Interpolate monotonic total variance
-        try:
-            f = interp1d(available_tte, total_variance, kind='linear',
-                         bounds_error=False, fill_value='extrapolate')
-            total_var_interp = f(tte_grid_years)
-
-            # Convert back to implied volatility
-            grid_final[:, j] = np.sqrt(total_var_interp / np.maximum(tte_grid_years, 1 / 36525))
-        except:
-            continue
-
-    grid_final = np.maximum(grid_final, 0.03)
-    return grid_final
-
-surfaces = {}
-total_built = 0
-
-for symbol in SYMBOLS:
-    print(f"\n  {symbol}:")
-    sym_data = df_clean[df_clean['underlying_symbol'] == symbol].copy()
-    dates = sorted(sym_data['asofdate'].unique())
-
-    surfaces[symbol] = {}
-    built = 0
-
-    for asofdate in dates:
-        day_data = sym_data[sym_data['asofdate'] == asofdate]
-
-
-
-        grid = build_iv_surface_for_day(day_data)
-
-        if grid is not None and not np.isnan(grid).all():
-            surfaces[symbol][asofdate.date().isoformat()] = {
-                'date': asofdate.date().isoformat(),
-                'n_quotes': len(day_data),
-                'n_calls': len(day_data[day_data['option_type'] == 'call']),
-                'n_puts': len(day_data[day_data['option_type'] == 'put']),
-                'iv_surface': grid.tolist(),
-            }
-            built += 1
-            total_built += 1
-
-    print(f"    ✓ Built {built} surfaces")
-
-print(f"\n✓ Total surfaces built: {total_built}")
-
-# ================================
-# 8. SAVE RESULTS
-# ================================
-save_data = {
-    'generated_at': datetime.now().isoformat(),
-    'source': 'Arbitrage-free surfaces with standardized filtering',
-    'pipeline': 'Common Filters → BS Prices → No-Arb → Clean IV → Surface',
-    'symbols': SYMBOLS,
-    'total_surfaces': total_built,
-    'moneyness_grid': MONEYNESS_GRID.tolist(),
-    'dte_grid': DTE_GRID.tolist(),
-    'surfaces': surfaces,
-    'dividend_yields': DIVIDEND_YIELDS,
-    'statistics': {
-        'total_raw_quotes': int(initial_count),
-        'total_clean_quotes': int(after_count),
-        'pcp_corrections': int(pcp_corrections),
-
-        'surfaces_built': int(total_built),
-    }
+CONFIG = {
+    'dte_tolerance': 15,  # Days tolerance (absolute)
+    'moneyness_tolerance': 0.08,  # Log moneyness tolerance (wider)
+    'interpolation_min_points': 5,  # Reduced minimum points
+    'colorscale_multiplier': 2,
+    'generate_comparison_plots': False,
+    'auto_open_browser': True,
+    'use_rbf_interpolation': True,  # Better interpolation method
 }
 
-with open(OUTPUT_FILE, 'wb') as f:
-    pickle.dump(save_data, f)
 
-import os
-size_mb = os.path.getsize(OUTPUT_FILE) / 1e6
-print(f"\n✓ Saved → {OUTPUT_FILE} ({size_mb:.1f} MB)")
-print("\n✓ Ready for Step 5: Market Inefficiency Score (MIS) Calculation")
+class IVSurfaceVisualizer:
+    """Handles IV surface visualization with MIS color coding"""
+
+    def __init__(self, surface_path='iv_surfaces_arbitrage_free.pkl',
+                 mis_path='mis_scores.pkl'):
+        """Initialize visualizer with data paths"""
+        self.surface_path = surface_path
+        self.mis_path = mis_path
+        self.load_data()
+
+    def load_data(self):
+        """Load IV surfaces and MIS scores with error handling"""
+        try:
+            print("Loading IV surfaces...")
+            with open(self.surface_path, 'rb') as f:
+                surface_data = pickle.load(f)
+
+            self.surfaces = surface_data['surfaces']
+            self.moneyness_grid = np.array(surface_data['moneyness_grid'])
+            self.dte_grid = np.array(surface_data['dte_grid'])
+            self.symbols = surface_data['symbols']
+
+            print(f"  ✓ Loaded surfaces for {len(self.symbols)} symbols")
+            print(f"  ✓ Moneyness range: [{self.moneyness_grid.min():.3f}, {self.moneyness_grid.max():.3f}]")
+            print(f"  ✓ DTE range: [{self.dte_grid.min()}, {self.dte_grid.max()}]")
+
+        except FileNotFoundError:
+            print(f"ERROR: Surface file not found: {self.surface_path}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"ERROR loading surfaces: {e}")
+            sys.exit(1)
+
+        try:
+            print("\nLoading MIS scores...")
+            with open(self.mis_path, 'rb') as f:
+                mis_data = pickle.load(f)
+
+            self.df_mis = mis_data['data']
+            self.mis_threshold = mis_data['mis_threshold']
+
+            print(f"  ✓ MIS threshold: {self.mis_threshold:.4f}")
+            print(f"  ✓ Total MIS records: {len(self.df_mis)}")
+
+            # Print sample of MIS data for debugging
+            if len(self.df_mis) > 0:
+                print(f"  ✓ MIS range: [{self.df_mis['MIS'].min():.4f}, {self.df_mis['MIS'].max():.4f}]")
+                print(
+                    f"  ✓ Moneyness range: [{self.df_mis['log_moneyness'].min():.3f}, {self.df_mis['log_moneyness'].max():.3f}]")
+                print(f"  ✓ DTE range: [{self.df_mis['days_to_exp'].min()}, {self.df_mis['days_to_exp'].max()}]")
+
+        except FileNotFoundError:
+            print(f"ERROR: MIS file not found: {self.mis_path}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"ERROR loading MIS data: {e}")
+            sys.exit(1)
+
+    def map_mis_to_grid_improved(self, mis_subset, iv_grid):
+        """
+        FIXED: Improved MIS mapping with proper coordinate handling
+        """
+        mis_grid = np.full_like(iv_grid, np.nan, dtype=float)
+
+        if len(mis_subset) == 0:
+            return mis_grid
+
+        # Extract option data
+        option_dte = mis_subset['days_to_exp'].values
+        option_moneyness = mis_subset['log_moneyness'].values
+        option_mis = mis_subset['MIS'].values
+
+        print(f"    Mapping {len(option_mis)} MIS scores to grid...")
+        print(f"      Option DTE range: [{option_dte.min()}, {option_dte.max()}]")
+        print(f"      Option moneyness range: [{option_moneyness.min():.3f}, {option_moneyness.max():.3f}]")
+
+        # For each grid point, find nearby options and average their MIS
+        n_mapped = 0
+        for i, dte in enumerate(self.dte_grid):
+            for j, moneyness in enumerate(self.moneyness_grid):
+                # Skip if IV is invalid
+                if np.isnan(iv_grid[i, j]) or iv_grid[i, j] <= 0:
+                    continue
+
+                # Find options within tolerance
+                dte_match = np.abs(option_dte - dte) <= CONFIG['dte_tolerance']
+                moneyness_match = np.abs(option_moneyness - moneyness) <= CONFIG['moneyness_tolerance']
+                nearby = dte_match & moneyness_match
+
+                if nearby.any():
+                    # Weight by distance (inverse distance weighting)
+                    dte_dist = np.abs(option_dte[nearby] - dte)
+                    moneyness_dist = np.abs(option_moneyness[nearby] - moneyness)
+
+                    # Normalize distances
+                    dte_dist_norm = dte_dist / CONFIG['dte_tolerance']
+                    moneyness_dist_norm = moneyness_dist / CONFIG['moneyness_tolerance']
+
+                    # Combined distance
+                    distances = np.sqrt(dte_dist_norm ** 2 + moneyness_dist_norm ** 2)
+
+                    # Inverse distance weights (add small epsilon to avoid division by zero)
+                    weights = 1.0 / (distances + 0.01)
+                    weights = weights / weights.sum()
+
+                    # Weighted average
+                    mis_grid[i, j] = np.sum(option_mis[nearby] * weights)
+                    n_mapped += 1
+
+        print(f"      ✓ Mapped MIS to {n_mapped} grid points ({100 * n_mapped / mis_grid.size:.1f}% coverage)")
+
+        return mis_grid
+
+    def interpolate_missing_values_rbf(self, mis_grid):
+        """
+        FIXED: Better interpolation using RBF (Radial Basis Function)
+        Falls back to nearest neighbor if too few points
+        """
+        valid_mask = ~np.isnan(mis_grid)
+        n_valid = valid_mask.sum()
+
+        print(f"      Interpolating from {n_valid} valid points...")
+
+        if n_valid < CONFIG['interpolation_min_points']:
+            print(f"      ⚠ Warning: Only {n_valid} valid points, using zero-fill")
+            return np.nan_to_num(mis_grid, nan=0.0)
+
+        # Get valid coordinates and values
+        valid_indices = np.where(valid_mask)
+        valid_dte_idx = valid_indices[0]
+        valid_mon_idx = valid_indices[1]
+        valid_values = mis_grid[valid_mask]
+
+        # Map to actual coordinates
+        valid_coords = np.column_stack([
+            self.dte_grid[valid_dte_idx],
+            self.moneyness_grid[valid_mon_idx]
+        ])
+
+        # Get all grid coordinates
+        dte_mesh, mon_mesh = np.meshgrid(self.dte_grid, self.moneyness_grid, indexing='ij')
+        all_coords = np.column_stack([
+            dte_mesh.ravel(),
+            mon_mesh.ravel()
+        ])
+
+        try:
+            # Try cubic interpolation first
+            interpolated = griddata(
+                valid_coords,
+                valid_values,
+                all_coords,
+                method='cubic',
+                fill_value=0.0
+            )
+
+            # If cubic fails, try linear
+            if np.isnan(interpolated).any():
+                interpolated = griddata(
+                    valid_coords,
+                    valid_values,
+                    all_coords,
+                    method='linear',
+                    fill_value=0.0
+                )
+
+            # If still has NaNs, use nearest neighbor
+            if np.isnan(interpolated).any():
+                interpolated = griddata(
+                    valid_coords,
+                    valid_values,
+                    all_coords,
+                    method='nearest'
+                )
+
+            mis_grid_filled = interpolated.reshape(mis_grid.shape)
+
+            # Smooth the result (optional)
+            from scipy.ndimage import gaussian_filter
+            mis_grid_filled = gaussian_filter(mis_grid_filled, sigma=0.5)
+
+            print(f"      ✓ Interpolation complete")
+            return np.nan_to_num(mis_grid_filled, nan=0.0)
+
+        except Exception as e:
+            print(f"      ⚠ Interpolation failed ({e}), using nearest neighbor")
+            interpolated = griddata(
+                valid_coords,
+                valid_values,
+                all_coords,
+                method='nearest'
+            )
+            return interpolated.reshape(mis_grid.shape)
+
+    def create_mis_colored_surface(self, symbol, date_str=None):
+        """Create IV surface colored by MIS scores with time slider"""
+
+        if symbol not in self.surfaces or len(self.surfaces[symbol]) == 0:
+            print(f"  ✗ No surfaces available for {symbol}")
+            return None
+
+        # Get available dates
+        dates = sorted(self.surfaces[symbol].keys())
+
+        if len(dates) == 0:
+            print(f"  ✗ No dates available for {symbol}")
+            return None
+
+        print(f"\n  Creating MIS-colored surface for {symbol} ({len(dates)} dates)...")
+
+        # Create meshgrid - CRITICAL: Use correct indexing
+        X, Y = np.meshgrid(self.moneyness_grid, self.dte_grid)
+
+        # Prepare data for all dates
+        frames = []
+        frame_data = []
+
+        for date_str in dates:
+            if date_str not in self.surfaces[symbol]:
+                continue
+
+            surface_info = self.surfaces[symbol][date_str]
+            iv_grid = np.array(surface_info['iv_surface'])
+
+            date_obj = pd.to_datetime(date_str)
+            mis_subset = self.df_mis[
+                (self.df_mis['underlying_symbol'] == symbol) &
+                (self.df_mis['asofdate'] == date_obj)
+                ].copy()
+
+            if len(mis_subset) == 0:
+                print(f"    ⚠ No MIS data for {date_str}")
+                continue
+
+            print(f"    Processing {date_str}: {len(mis_subset)} options")
+
+            # Map MIS scores to grid
+            mis_grid = self.map_mis_to_grid_improved(mis_subset, iv_grid)
+            mis_grid = self.interpolate_missing_values_rbf(mis_grid)
+
+            # Store frame data
+            frame_data.append({
+                'date': date_str,
+                'iv_grid': iv_grid,
+                'mis_grid': mis_grid,
+                'num_options': len(mis_subset)
+            })
+
+        if len(frame_data) == 0:
+            print(f"  ✗ No valid data for any date")
+            return None
+
+        print(f"\n  ✓ Successfully processed {len(frame_data)} dates")
+
+        # Create frames for animation
+        for data in frame_data:
+            frames.append(go.Frame(
+                data=[go.Surface(
+                    x=X,
+                    y=Y,
+                    z=data['iv_grid'],
+                    surfacecolor=data['mis_grid'],
+                    colorscale=[
+                        [0.0, 'rgb(68, 1, 84)'],  # Dark purple
+                        [0.25, 'rgb(59, 82, 139)'],  # Blue
+                        [0.5, 'rgb(33, 145, 140)'],  # Teal
+                        [0.75, 'rgb(253, 231, 37)'],  # Yellow
+                        [1.0, 'rgb(254, 0, 0)']  # Red
+                    ],
+                    hovertemplate=(
+                            '<b>Moneyness:</b> %{x:.3f}<br>' +
+                            '<b>Days to Exp:</b> %{y:.0f}<br>' +
+                            '<b>IV:</b> %{z:.2%}<br>' +
+                            '<b>MIS:</b> %{surfacecolor:.4f}<br>' +
+                            '<extra></extra>'
+                    ),
+                    cmin=0,
+                    cmax=self.mis_threshold * CONFIG['colorscale_multiplier'],
+                    showscale=True
+                )],
+                name=data['date'],
+                layout=go.Layout(
+                    title=dict(
+                        text=f"<b>{symbol}</b> Implied Volatility Surface with MIS Coloring<br>" +
+                             f"<sub>{data['date']} | {data['num_options']} options | Threshold: {self.mis_threshold:.3f}</sub>"
+                    )
+                )
+            ))
+
+        # Create initial frame (most recent date)
+        initial_data = frame_data[-1]
+
+        # Create figure with initial data
+        fig = go.Figure(
+            data=[go.Surface(
+                x=X,
+                y=Y,
+                z=initial_data['iv_grid'],
+                surfacecolor=initial_data['mis_grid'],
+                colorscale=[
+                    [0.0, 'rgb(68, 1, 84)'],
+                    [0.25, 'rgb(59, 82, 139)'],
+                    [0.5, 'rgb(33, 145, 140)'],
+                    [0.75, 'rgb(253, 231, 37)'],
+                    [1.0, 'rgb(254, 0, 0)']
+                ],
+                colorbar=dict(
+                    title=dict(text="MIS Score", side="right"),
+                    tickmode="linear",
+                    tick0=0,
+                    dtick=0.5,
+                    len=0.7,
+                    x=1.15
+                ),
+                hovertemplate=(
+                        '<b>Moneyness:</b> %{x:.3f}<br>' +
+                        '<b>Days to Exp:</b> %{y:.0f}<br>' +
+                        '<b>IV:</b> %{z:.2%}<br>' +
+                        '<b>MIS:</b> %{surfacecolor:.4f}<br>' +
+                        '<extra></extra>'
+                ),
+                cmin=0,
+                cmax=self.mis_threshold * CONFIG['colorscale_multiplier'],
+                showscale=True
+            )],
+            frames=frames
+        )
+
+        # Create slider steps
+        sliders = [dict(
+            active=len(frame_data) - 1,
+            yanchor="top",
+            y=0,
+            xanchor="left",
+            x=0.1,
+            currentvalue=dict(
+                prefix="Date: ",
+                visible=True,
+                xanchor="right"
+            ),
+            pad=dict(b=10, t=50),
+            len=0.9,
+            steps=[dict(
+                args=[
+                    [data['date']],
+                    dict(
+                        frame=dict(duration=300, redraw=True),
+                        mode="immediate",
+                        transition=dict(duration=300)
+                    )
+                ],
+                label=data['date'],
+                method="animate"
+            ) for data in frame_data]
+        )]
+
+        # Update layout
+        fig.update_layout(
+            title=dict(
+                text=f"<b>{symbol}</b> Implied Volatility Surface with MIS Coloring<br>" +
+                     f"<sub>{initial_data['date']} | {initial_data['num_options']} options | Threshold: {self.mis_threshold:.3f}</sub>",
+                x=0.5,
+                xanchor='center'
+            ),
+            scene=dict(
+                xaxis=dict(
+                    title=dict(text="Log Moneyness ln(K/S)", font=dict(size=14)),
+                    tickformat=".2f",
+                    backgroundcolor="rgb(240, 240, 240)",
+                    gridcolor="white",
+                    showbackground=True,
+                ),
+                yaxis=dict(
+                    title=dict(text="Days to Expiration", font=dict(size=14)),
+                    backgroundcolor="rgb(240, 240, 240)",
+                    gridcolor="white",
+                    showbackground=True,
+                ),
+                zaxis=dict(
+                    title=dict(text="Implied Volatility", font=dict(size=14)),
+                    tickformat=".0%",
+                    backgroundcolor="rgb(240, 240, 240)",
+                    gridcolor="white",
+                    showbackground=True,
+                ),
+                camera=dict(
+                    eye=dict(x=1.5, y=1.5, z=1.3)
+                )
+            ),
+            sliders=sliders,
+            updatemenus=[dict(
+                type="buttons",
+                direction="left",
+                x=0.1,
+                y=1.15,
+                buttons=[
+                    dict(
+                        args=[None, dict(
+                            frame=dict(duration=500, redraw=True),
+                            fromcurrent=True,
+                            mode="immediate",
+                            transition=dict(duration=300)
+                        )],
+                        label="▶ Play",
+                        method="animate"
+                    ),
+                    dict(
+                        args=[[None], dict(
+                            frame=dict(duration=0, redraw=True),
+                            mode="immediate",
+                            transition=dict(duration=0)
+                        )],
+                        label="⏸ Pause",
+                        method="animate"
+                    )
+                ]
+            )],
+            height=800,
+            width=1200,
+            template="plotly_white",
+            showlegend=False
+        )
+
+        return fig
+
+    def generate_all_visualizations(self):
+        """Generate visualizations for all symbols"""
+        print("\n" + "=" * 70)
+        print("GENERATING VISUALIZATIONS")
+        print("=" * 70)
+
+        output_dir = Path('output')
+        output_dir.mkdir(exist_ok=True)
+
+        generated = []
+
+        for symbol in self.symbols:
+            print(f"\n📊 Processing {symbol}...")
+
+            fig = self.create_mis_colored_surface(symbol)
+
+            if fig is not None:
+                filename = output_dir / f'iv_surface_mis_{symbol}.html'
+                fig.write_html(str(filename))
+                print(f"\n  ✓ Saved: {filename}")
+                generated.append(str(filename))
+
+                if CONFIG['auto_open_browser']:
+                    fig.show()
+
+        return generated
+
+
+def main():
+    """Main execution function"""
+    print("""
+╔════════════════════════════════════════════════════════════════╗
+║   IV SURFACE VISUALIZATION WITH MIS COLOR CODING (FIXED)       ║
+║   Interactive 3D plots with mispricing highlights              ║
+╚════════════════════════════════════════════════════════════════╝
+    """)
+
+    visualizer = IVSurfaceVisualizer()
+    generated = visualizer.generate_all_visualizations()
+
+    print("\n" + "=" * 70)
+    print("VISUALIZATION COMPLETE")
+    print("=" * 70)
+    print(f"\n✓ Generated {len(generated)} visualizations")
+    print("\nFiles created:")
+    for filepath in generated:
+        print(f"  • {filepath}")
+    print("\nColor scale:")
+    print("  🟣 Dark purple = Low MIS (efficient pricing)")
+    print("  🔵 Blue = Moderate MIS")
+    print("  🟢 Teal = Above average MIS")
+    print("  🟡 Yellow = High MIS")
+    print("  🔴 Red = Very high MIS (significant mispricing)")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
