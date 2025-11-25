@@ -39,7 +39,8 @@ CONFIG = {
     'jump_cutoff': 4.0,
 }
 
-SYMBOLS = ['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'XOM', 'JPM']
+SYMBOLS = ['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSLA', 'XOM', 'JPM']
+
 
 
 class DataLoader:

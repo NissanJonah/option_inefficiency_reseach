@@ -39,6 +39,7 @@ RISK_FREE_RATE = 0.04
 # ================================
 print("\n" + "=" * 70)
 print("STEP 1: LOADING & FILTERING OPTIONS DATA")
+
 print("=" * 70)
 
 conn = connect_to_db()

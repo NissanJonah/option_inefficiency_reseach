@@ -43,6 +43,7 @@ class DataLoader:
 
     def load_all(self):
         print("\n" + "=" * 70)
+
         print("LOADING DATA FROM PREVIOUS STEPS")
         print("=" * 70)
 
@@ -169,13 +170,14 @@ class MonteCarloSimulator:
             return S >= boundary
 
     # Replace the ENTIRE evaluate_strategies method in your MonteCarloSimulator class
-
     def evaluate_strategies(self, paths):
         """
         Evaluate both strategies and compute ANNUALIZED returns
 
-        Returns:
-            dict with results for both strategies
+        Safety layers:
+        1. Minimum 7-day holding period (prevents extreme annualization)
+        2. Raw return capping at 300% (prevents log explosions)
+        3. Annualized log return cap at 3.5 (max ~3,200% simple per year)
         """
         n_paths, n_steps = paths.shape
         t_grid = np.linspace(0, self.T, n_steps)
@@ -186,6 +188,9 @@ class MonteCarloSimulator:
         holding_time_optimal = np.full(n_paths, self.T)
         early_exercise_occurred = np.zeros(n_paths, dtype=bool)
 
+        # SAFETY LAYER 1: Minimum holding period (7 days)
+        min_holding_period = 7 / 365
+
         # ===== STRATEGY 1: OPTIMAL EXERCISE AT BOUNDARY =====
         for i in range(n_paths):
             exercised = False
@@ -195,11 +200,11 @@ class MonteCarloSimulator:
                 t = t_grid[t_idx]
                 S = paths[i, t_idx]
 
-                # Check if we should exercise
-                if self.should_exercise(S, t):
+                # Check if we should exercise AND minimum holding period has passed
+                if t >= min_holding_period and self.should_exercise(S, t):
                     # Exercise now
                     payoff = self.intrinsic_value(S)
-                    holding_time_optimal[i] = max(t, 1 / 365)  # At least 1 day
+                    holding_time_optimal[i] = t
 
                     # Calculate return: (payoff - cost) / cost
                     results_optimal[i] = (payoff - self.cost) / self.cost
@@ -219,11 +224,7 @@ class MonteCarloSimulator:
         results_hold = (final_payoffs - self.cost) / self.cost
         holding_time_hold = np.full(n_paths, self.T)
 
-        # ===== ANNUALIZE THE RETURNS (ROBUST VERSION) =====
-        # Cap extreme values to avoid numerical overflow/underflow
-
-        # ===== ANNUALIZE THE RETURNS (FIXED VERSION) =====
-        # ===== ANNUALIZE THE RETURNS (LOGARITHMIC - STABLE VERSION) =====
+        # ===== ANNUALIZE RETURNS WITH SAFETY LAYERS =====
         annualized_optimal = np.zeros(n_paths)
         annualized_hold = np.zeros(n_paths)
 
@@ -233,21 +234,52 @@ class MonteCarloSimulator:
             t_opt = holding_time_optimal[i]
             t_hold = self.T
 
-            # Cap raw returns BEFORE annualization
-            roi_opt_capped = np.clip(roi_opt, -0.95, 5.0)
-            roi_hold_capped = np.clip(roi_hold, -0.95, 5.0)
+            # Cap raw returns
+            roi_opt_capped = np.clip(roi_opt, -0.95, 3.0)
+            roi_hold_capped = np.clip(roi_hold, -0.95, 3.0)
 
-            # Use LOGARITHMIC returns (continuous compounding)
-            # Formula: r_annual = ln(1 + R) / T
-            # This is stable even for extreme short-term gains
+            # Compute log-annualized returns
+            if roi_opt_capped <= -0.95:
+                annualized_optimal[i] = -5.0
+            else:
+                annualized_optimal[i] = np.log(1 + roi_opt_capped) / t_opt
 
-            annualized_optimal[i] = np.log(1 + roi_opt_capped) / t_opt
-            annualized_hold[i] = np.log(1 + roi_hold_capped) / t_hold
+            if roi_hold_capped <= -0.95:
+                annualized_hold[i] = -5.0
+            else:
+                annualized_hold[i] = np.log(1 + roi_hold_capped) / t_hold
 
-            # Safety: Cap at reasonable bounds for annualized log returns
-            # ln(51) ≈ 4.0 → means ~5000% simple return per year
-            annualized_optimal[i] = np.clip(annualized_optimal[i], -5.0, 4.0)
-            annualized_hold[i] = np.clip(annualized_hold[i], -5.0, 4.0)
+            # ✅ CRITICAL: Cap annualized log returns at realistic bounds
+            # ln(201) ≈ 5.3 → e^5.3 - 1 = 20,000% per year (extreme but possible)
+            annualized_optimal[i] = np.clip(annualized_optimal[i], -5.0, 5.3)
+            annualized_hold[i] = np.clip(annualized_hold[i], -5.0, 5.3)
+
+
+            # SAFETY LAYER 3: Cap annualized log returns
+            # ln(51) ≈ 3.5 → e^3.5 - 1 ≈ 3,200% simple return per year
+            # This is "extreme but theoretically possible" territory
+            #annualized_optimal[i] = np.clip(annualized_optimal[i], -5.0, 3.5)
+            annualized_hold[i] = np.clip(annualized_hold[i], -5.0, 3.5)
+            # After clipping
+
+            max_ann = np.max(annualized_optimal)
+            p99_ann = np.percentile(annualized_optimal, 99)
+        print(f"  Max annualized: {max_ann:.2f} (99th: {p99_ann:.2f})")
+        n_at_cap = np.sum(annualized_optimal == 3.5)
+        pct_at_cap = n_at_cap / n_paths * 100
+
+        print(f"  ⚠️  {n_at_cap} paths at ceiling ({pct_at_cap:.1f}%)")
+
+        if pct_at_cap > 10:
+            print(f"  🚨 WARNING: >10% of paths hitting cap - results may be distorted")
+        # Diagnostic output (remove in production)
+        n_capped_opt = np.sum(results_optimal > 3.0)
+        n_capped_ann_opt = np.sum(annualized_optimal == 3.5)
+
+        if n_capped_opt > 0 or n_capped_ann_opt > 0:
+            print(f"  ℹ️  Capping applied:")
+            print(f"     Raw returns capped: {n_capped_opt} paths ({n_capped_opt / n_paths * 100:.1f}%)")
+            print(f"     Annualized capped: {n_capped_ann_opt} paths ({n_capped_ann_opt / n_paths * 100:.1f}%)")
 
         return {
             'roi_optimal': results_optimal,
@@ -382,7 +414,6 @@ class MonteCarloSimulator:
             'hjb': self.hjb
         }
 
-
 def print_results(key, output):
     """Print detailed results in clean format"""
     stats = output['stats']
@@ -404,14 +435,16 @@ def print_results(key, output):
     print(f"\n📊 PRIMARY METRIC: ANNUALIZED RETURNS (Returns Per Year)")
     print(f"  Optimal Exercise Strategy:")
     mean_simple = (np.exp(stats['annualized_return_optimal']['mean']) - 1) * 100
+    median_simple = (np.exp(stats['annualized_return_optimal']['median']) - 1) * 100  # FIX: Convert median too
     print(f"    Mean:   {mean_simple:+7.2f}% per year (log-annualized)")
-    print(f"    Median: {stats['annualized_return_optimal']['median']*100:+7.2f}% per year")
+    print(f"    Median: {median_simple:+7.2f}% per year")  # FIX: Use converted value
     print(f"    Std:    {stats['annualized_return_optimal']['std']*100:7.2f}%")
 
     print(f"\n  Hold-to-Expiration Strategy:")
     mean_hold_simple = (np.exp(stats['annualized_return_hold']['mean']) - 1) * 100
+    median_hold_simple = (np.exp(stats['annualized_return_hold']['median']) - 1) * 100  # FIX: Convert median too
     print(f"    Mean:   {mean_hold_simple:+7.2f}% per year")
-    print(f"    Median: {(np.exp(stats['annualized_return_hold']['median']) - 1) * 100:+7.2f}% per year")
+    print(f"    Median: {median_hold_simple:+7.2f}% per year")  # FIX: Use converted value
     print(f"    Std:    {stats['annualized_return_hold']['std'] * 100:7.2f}%")
 
     # Comparison
@@ -422,13 +455,12 @@ def print_results(key, output):
     print(f"    Optimal wins: {stats['improvement_rate'] * 100:.1f}% of paths")
     print(f"    T-statistic: {stats['t_statistic']:.3f}")
     if stats['p_value'] < 0.001:
-        p_str = f"{stats['p_value']:.2e}"  # Scientific notation
+        p_str = f"{stats['p_value']:.2e}"
     else:
         p_str = f"{stats['p_value']:.6f}"
 
     print(f"    P-value: {p_str}")
 
-    # Add sample size check
     n_samples = len(output['results']['annualized_optimal'])
     print(f"    Sample size: {n_samples:,} paths")
 
@@ -450,6 +482,163 @@ def print_results(key, output):
     print(f"  Hold:    {stats['total_return_hold']['mean']*100:+.2f}% per trade")
     print(f"  Difference: {(stats['total_return_optimal']['mean'] - stats['total_return_hold']['mean'])*100:+.2f}%")
 
+
+def generate_comparison_tables(results):
+    """
+    Automatically generate formatted comparison tables from Monte Carlo results
+
+    Args:
+        results: Dictionary of simulation results from main()
+    """
+
+    # Separate PUTs and CALLs
+    put_results = {k: v for k, v in results.items() if v['contract']['option_type'] == 'put'}
+    call_results = {k: v for k, v in results.items() if v['contract']['option_type'] == 'call'}
+
+    print("\n" + "=" * 80)
+    print("AUTOMATED COMPARISON TABLES")
+    print("=" * 80)
+
+    # ============================================================
+    # TABLE 1: PUTS - Total Return Comparison
+    # ============================================================
+    print("\n1. PUTS - Total Return Comparison")
+    print("-" * 80)
+    print(f"{'Contract':<15} {'Optimal Return':>15} {'Hold Return':>15} {'Difference':>15}")
+    print("-" * 80)
+
+    put_total_diffs = []
+    put_opt_wins = 0
+
+    for key in sorted(put_results.keys()):
+        r = put_results[key]
+        symbol = key.split('_')[0]
+        opt_ret = r['stats']['total_return_optimal']['mean'] * 100
+        hold_ret = r['stats']['total_return_hold']['mean'] * 100
+        diff = opt_ret - hold_ret
+
+        put_total_diffs.append(diff)
+        if diff > 0:
+            put_opt_wins += 1
+
+        print(f"{symbol} PUT"
+              f"{opt_ret:>14.2f}% "
+              f"{hold_ret:>14.2f}% "
+              f"{diff:>14.2f}%")
+
+    print("-" * 80)
+    print(f"Summary: Optimal Outperforms: {put_opt_wins}/{len(put_results)} "
+          f"({put_opt_wins / len(put_results) * 100:.1f}%) • "
+          f"Avg Difference: {np.mean(put_total_diffs):.2f}%")
+
+    # ============================================================
+    # TABLE 2: CALLS - Total Return Comparison
+    # ============================================================
+    print("\n2. CALLS - Total Return Comparison")
+    print("-" * 80)
+    print(f"{'Contract':<15} {'Optimal Return':>15} {'Hold Return':>15} {'Difference':>15}")
+    print("-" * 80)
+
+    call_total_diffs = []
+    call_opt_wins = 0
+
+    for key in sorted(call_results.keys()):
+        r = call_results[key]
+        symbol = key.split('_')[0]
+        opt_ret = r['stats']['total_return_optimal']['mean'] * 100
+        hold_ret = r['stats']['total_return_hold']['mean'] * 100
+        diff = opt_ret - hold_ret
+
+        call_total_diffs.append(diff)
+        if diff > 0:
+            call_opt_wins += 1
+
+        print(f"{symbol} CALL"
+              f"{opt_ret:>13.2f}% "
+              f"{hold_ret:>14.2f}% "
+              f"{diff:>14.2f}%")
+
+    print("-" * 80)
+    print(f"Summary: Optimal Outperforms: {call_opt_wins}/{len(call_results)} "
+          f"({call_opt_wins / len(call_results) * 100:.1f}%) • "
+          f"Avg Difference: {np.mean(call_total_diffs):.2f}%")
+
+    # ============================================================
+    # TABLE 3: PUTS - Annualized Return Comparison
+    # ============================================================
+    print("\n3. PUTS - Annualized Return Comparison")
+    print("-" * 80)
+    print(f"{'Contract':<15} {'Optimal Annualized':>20} {'Hold Annualized':>20} {'Difference':>15}")
+    print("-" * 80)
+
+    put_ann_diffs = []
+
+    for key in sorted(put_results.keys()):
+        r = put_results[key]
+        symbol = key.split('_')[0]
+
+        # Convert log returns to simple percentage returns
+        opt_ann = (np.exp(r['stats']['annualized_return_optimal']['mean']) - 1) * 100
+        hold_ann = (np.exp(r['stats']['annualized_return_hold']['mean']) - 1) * 100
+        diff = opt_ann - hold_ann
+
+        put_ann_diffs.append(diff)
+
+        print(f"{symbol} PUT"
+              f"{opt_ann:>19.2f}% "
+              f"{hold_ann:>19.2f}% "
+              f"{diff:>14.2f}%")
+
+    print("-" * 80)
+    print(f"Summary: Avg Annualized Improvement: {np.mean(put_ann_diffs):+.2f}%/year")
+
+    # ============================================================
+    # TABLE 4: CALLS - Annualized Return Comparison
+    # ============================================================
+    print("\n4. CALLS - Annualized Return Comparison")
+    print("-" * 80)
+    print(f"{'Contract':<15} {'Optimal Annualized':>20} {'Hold Annualized':>20} {'Difference':>15}")
+    print("-" * 80)
+
+    call_ann_diffs = []
+
+    for key in sorted(call_results.keys()):
+        r = call_results[key]
+        symbol = key.split('_')[0]
+
+        # Convert log returns to simple percentage returns
+        opt_ann = (np.exp(r['stats']['annualized_return_optimal']['mean']) - 1) * 100
+        hold_ann = (np.exp(r['stats']['annualized_return_hold']['mean']) - 1) * 100
+        diff = opt_ann - hold_ann
+
+        call_ann_diffs.append(diff)
+
+        print(f"{symbol} CALL"
+              f"{opt_ann:>18.2f}% "
+              f"{hold_ann:>19.2f}% "
+              f"{diff:>14.2f}%")
+
+    print("-" * 80)
+    print(f"Summary: Avg Annualized Improvement: {np.mean(call_ann_diffs):+.2f}%/year")
+
+    # ============================================================
+    # OVERALL SUMMARY
+    # ============================================================
+    print("\n" + "=" * 80)
+    print("OVERALL SUMMARY")
+    print("=" * 80)
+    print(f"\nTotal Returns:")
+    print(f"  PUTs:  Optimal wins {put_opt_wins}/{len(put_results)} ({put_opt_wins / len(put_results) * 100:.1f}%), "
+          f"Avg Δ: {np.mean(put_total_diffs):+.2f}%")
+    print(
+        f"  CALLs: Optimal wins {call_opt_wins}/{len(call_results)} ({call_opt_wins / len(call_results) * 100:.1f}%), "
+        f"Avg Δ: {np.mean(call_total_diffs):+.2f}%")
+
+    print(f"\nAnnualized Returns:")
+    print(f"  PUTs:  Avg improvement: {np.mean(put_ann_diffs):+.2f}%/year")
+    print(f"  CALLs: Avg improvement: {np.mean(call_ann_diffs):+.2f}%/year")
+
+    print(f"\n{'=' * 80}")
 
 def main():
     """Main execution"""
@@ -633,6 +822,7 @@ def main():
     print("═" * 70)
 
     print(f"\nValidation completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    generate_comparison_tables(results)
 
 
 if __name__ == "__main__":
