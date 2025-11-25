@@ -1107,6 +1107,7 @@ def plot_regime_parameters_by_symbol(returns_df, features_df, detector, symbols=
     fig.show()
     return fig
 
+
 def main():
     """Execute complete pipeline"""
 
@@ -1403,9 +1404,10 @@ def main():
         print("GENERATING FULL HISTORY REGIME PLOTS (with Train/Test split)")
         print("=" * 80)
 
+
         visualize_historical_regimes(save_data, underlying_df, symbol='SPY', train_end_date=train_end)
 
-        for sym in ['QQQ', 'IWM', 'AAPL', 'TSLA', 'MSFT', 'XOM', 'JPM']:
+        for sym in ['QQQ', 'IWM', 'AAPL', 'TSLA', 'MSFT', 'XOM', 'JPM', 'TSLA']:
             if sym in underlying_df['underlying_symbol'].unique():
                 visualize_historical_regimes(save_data, underlying_df, symbol=sym, train_end_date=train_end)
 

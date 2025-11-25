@@ -30,9 +30,8 @@ CONFIG = {
     'n_paths': 10000,
     'n_bootstrap': 1000,
     'risk_free_rate': 0.04,
-    'dividend_yields': get_dividend_yields(['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'XOM', 'JPM'])
+    'dividend_yields': get_dividend_yields(['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSLA', 'XOM', 'JPM'])
 }
-
 
 class DataLoader:
     """Load all required data from previous steps"""
@@ -223,31 +222,32 @@ class MonteCarloSimulator:
         # ===== ANNUALIZE THE RETURNS (ROBUST VERSION) =====
         # Cap extreme values to avoid numerical overflow/underflow
 
+        # ===== ANNUALIZE THE RETURNS (FIXED VERSION) =====
+        # ===== ANNUALIZE THE RETURNS (LOGARITHMIC - STABLE VERSION) =====
         annualized_optimal = np.zeros(n_paths)
         annualized_hold = np.zeros(n_paths)
 
         for i in range(n_paths):
-            # Optimal strategy
             roi_opt = results_optimal[i]
+            roi_hold = results_hold[i]
+            t_opt = holding_time_optimal[i]
+            t_hold = self.T
 
-            # Cap extreme values
-            # - Losses capped at -99.9% (avoid log(0) and negative powers)
-            # - Gains capped at +9900% (avoid overflow)
+            # Cap raw returns BEFORE annualization
+            roi_opt_capped = np.clip(roi_opt, -0.95, 5.0)
+            roi_hold_capped = np.clip(roi_hold, -0.95, 5.0)
 
-            if holding_time_optimal[i] > 0:
-                # Compound annualization: (1 + R)^(1/T) - 1
-                annualized_optimal[i] = ((1 + roi_opt) ** (1 / holding_time_optimal[i])) - 1
+            # Use LOGARITHMIC returns (continuous compounding)
+            # Formula: r_annual = ln(1 + R) / T
+            # This is stable even for extreme short-term gains
 
-                # Final cap on annualized returns (±10000% per year is reasonable max)
-                annualized_optimal[i] = np.clip(annualized_optimal[i], -0.9999, 99.0)
-            else:
-                annualized_optimal[i] = 0
+            annualized_optimal[i] = np.log(1 + roi_opt_capped) / t_opt
+            annualized_hold[i] = np.log(1 + roi_hold_capped) / t_hold
 
-            # Hold strategy
-            roi_hold = np.clip(results_hold[i], -0.999, 99.0)
-
-            annualized_hold[i] = ((1 + roi_hold) ** (1 / self.T)) - 1
-            annualized_hold[i] = np.clip(annualized_hold[i], -0.9999, 99.0)
+            # Safety: Cap at reasonable bounds for annualized log returns
+            # ln(51) ≈ 4.0 → means ~5000% simple return per year
+            annualized_optimal[i] = np.clip(annualized_optimal[i], -5.0, 4.0)
+            annualized_hold[i] = np.clip(annualized_hold[i], -5.0, 4.0)
 
         return {
             'roi_optimal': results_optimal,
@@ -265,6 +265,24 @@ class MonteCarloSimulator:
         # Basic stats for annualized returns
         ann_opt = results['annualized_optimal']
         ann_hold = results['annualized_hold']
+
+        n_invalid_opt = np.sum(~np.isfinite(ann_opt))
+        n_invalid_hold = np.sum(~np.isfinite(ann_hold))
+
+        if n_invalid_opt > 0:
+            print(f"   ⚠️ WARNING: {n_invalid_opt} invalid annualized returns (optimal)")
+        if n_invalid_hold > 0:
+            print(f"   ⚠️ WARNING: {n_invalid_hold} invalid annualized returns (hold)")
+
+        # Remove any remaining invalid values
+        ann_opt = ann_opt[np.isfinite(ann_opt)]
+        ann_hold = ann_hold[np.isfinite(ann_hold)]
+
+        if len(ann_opt) != len(ann_hold):
+            print(f"   ⚠️ WARNING: Length mismatch after filtering: {len(ann_opt)} vs {len(ann_hold)}")
+            min_len = min(len(ann_opt), len(ann_hold))
+            ann_opt = ann_opt[:min_len]
+            ann_hold = ann_hold[:min_len]
 
         stats = {
             # Annualized returns (PRIMARY METRIC)
@@ -315,13 +333,27 @@ class MonteCarloSimulator:
         }
 
         # Statistical test on annualized returns
-        if np.std(stats['annualized_difference']) > 1e-10:
-            t_stat, p_val = ttest_rel(ann_opt, ann_hold)
-            stats['t_statistic'] = t_stat
-            stats['p_value'] = p_val
+        # Statistical test on annualized returns
+        diff = stats['annualized_difference']
+        diff_clean = diff[np.isfinite(diff)]
+
+        if len(diff_clean) > 10 and np.std(diff_clean) > 1e-10:
+            # Use cleaned arrays for t-test
+            ann_opt_clean = ann_opt[np.isfinite(diff)]
+            ann_hold_clean = ann_hold[np.isfinite(diff)]
+
+            t_stat, p_val = ttest_rel(ann_opt_clean, ann_hold_clean)
+            stats['t_statistic'] = float(t_stat)
+            stats['p_value'] = float(p_val)
+
+            # Sanity check: p-value should be in [0, 1]
+            if not (0 <= p_val <= 1):
+                print(f"   ⚠️ WARNING: Invalid p-value {p_val}, setting to 1.0")
+                stats['p_value'] = 1.0
         else:
             stats['t_statistic'] = 0.0
             stats['p_value'] = 1.0
+            print(f"   ⚠️ Insufficient variance for t-test")
 
         # Effect size
         stats['cohens_d'] = (np.mean(stats['annualized_difference']) /
@@ -371,25 +403,37 @@ def print_results(key, output):
 
     print(f"\n📊 PRIMARY METRIC: ANNUALIZED RETURNS (Returns Per Year)")
     print(f"  Optimal Exercise Strategy:")
-    print(f"    Mean:   {stats['annualized_return_optimal']['mean']*100:+7.2f}% per year")
+    mean_simple = (np.exp(stats['annualized_return_optimal']['mean']) - 1) * 100
+    print(f"    Mean:   {mean_simple:+7.2f}% per year (log-annualized)")
     print(f"    Median: {stats['annualized_return_optimal']['median']*100:+7.2f}% per year")
     print(f"    Std:    {stats['annualized_return_optimal']['std']*100:7.2f}%")
 
     print(f"\n  Hold-to-Expiration Strategy:")
-    print(f"    Mean:   {stats['annualized_return_hold']['mean']*100:+7.2f}% per year")
-    print(f"    Median: {stats['annualized_return_hold']['median']*100:+7.2f}% per year")
-    print(f"    Std:    {stats['annualized_return_hold']['std']*100:7.2f}%")
+    mean_hold_simple = (np.exp(stats['annualized_return_hold']['mean']) - 1) * 100
+    print(f"    Mean:   {mean_hold_simple:+7.2f}% per year")
+    print(f"    Median: {(np.exp(stats['annualized_return_hold']['median']) - 1) * 100:+7.2f}% per year")
+    print(f"    Std:    {stats['annualized_return_hold']['std'] * 100:7.2f}%")
 
     # Comparison
-    mean_diff = stats['annualized_return_optimal']['mean'] - stats['annualized_return_hold']['mean']
+    mean_opt_simple = (np.exp(stats['annualized_return_optimal']['mean']) - 1) * 100
+    mean_diff_simple = mean_opt_simple - mean_hold_simple
     print(f"\n  📈 CAPITAL EFFICIENCY ADVANTAGE:")
-    print(f"    Annualized return difference: {mean_diff*100:+.2f}% per year")
-    print(f"    Optimal wins: {stats['improvement_rate']*100:.1f}% of paths")
+    print(f"    Annualized return difference: {mean_diff_simple:+.2f}% per year")
+    print(f"    Optimal wins: {stats['improvement_rate'] * 100:.1f}% of paths")
     print(f"    T-statistic: {stats['t_statistic']:.3f}")
-    print(f"    P-value: {stats['p_value']:.6f}")
+    if stats['p_value'] < 0.001:
+        p_str = f"{stats['p_value']:.2e}"  # Scientific notation
+    else:
+        p_str = f"{stats['p_value']:.6f}"
+
+    print(f"    P-value: {p_str}")
+
+    # Add sample size check
+    n_samples = len(output['results']['annualized_optimal'])
+    print(f"    Sample size: {n_samples:,} paths")
 
     if stats['p_value'] < 0.05:
-        if mean_diff > 0:
+        if mean_diff_simple > 0:
             print(f"    ✅ OPTIMAL STRATEGY SIGNIFICANTLY BETTER (p<0.05)")
         else:
             print(f"    ⚠️ HOLD STRATEGY SIGNIFICANTLY BETTER (p<0.05)")

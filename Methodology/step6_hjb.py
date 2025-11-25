@@ -12,7 +12,10 @@ from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
 from datetime import datetime
 import warnings
+import psycopg2
 from dividend_yields import get_dividend_yields
+from step1_redone_filtering import OptionsDataFilter, get_clean_options_data
+
 
 warnings.filterwarnings('ignore')
 
@@ -27,7 +30,7 @@ print("""
 CONFIG = {
     'output_file': 'hjb_optimal_boundaries.pkl',
     'risk_free_rate': 0.04,
-    'dividend_yields': get_dividend_yields(['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'XOM', 'JPM']),
+    'dividend_yields': get_dividend_yields(['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSLA', 'XOM', 'JPM']),
     'S_min_factor': 0.1,
     'S_max_factor': 2.0,
     'n_S_points': 800,
@@ -36,17 +39,17 @@ CONFIG = {
     'jump_cutoff': 4.0,
 }
 
-SYMBOLS = ['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'TSLA', 'XOM', 'JPM']
+SYMBOLS = ['SPY', 'QQQ', 'IWM', 'AAPL', 'MSFT', 'XOM', 'JPM']
 
 
 class DataLoader:
     """Load required inputs from previous steps"""
 
-
-    def __init__(self):
+    def __init__(self, db_connection):
         self.hmm_data = None
         self.jump_data = None
-        self.mis_data = None
+        self.options_data = None
+        self.db_connection = db_connection
 
     def load_all(self):
         print("\n" + "=" * 70)
@@ -71,13 +74,29 @@ class DataLoader:
             print("✗ jump_detection_results.pkl not found - run Step 3 first")
             return None
 
-        # Load MIS results (Step 5) for contract selection
+        # Load cleaned options data using Step 1 filter
         try:
-            with open('mis_scores.pkl', 'rb') as f:
-                self.mis_data = pickle.load(f)
-            print(f"✓ MIS: {len(self.mis_data['data'])} contracts loaded")
-        except FileNotFoundError:
-            print("✗ mis_scores.pkl not found - run Step 5 first")
+            print("✓ Loading options data from database...")
+
+            # Query raw options data
+            query = """
+            SELECT *
+            FROM options
+            WHERE underlying_symbol = ANY(%s)
+            ORDER BY asofdate, underlying_symbol
+            """
+
+            df_raw = pd.read_sql(query, self.db_connection, params=(SYMBOLS,))
+            print(f"  Raw options: {len(df_raw):,} records")
+
+            # Apply Step 1 filters
+            filter_obj = OptionsDataFilter(self.db_connection, verbose=False)
+            self.options_data = filter_obj.apply_filters(df_raw)
+
+            print(f"✓ Options: {len(self.options_data):,} contracts (after filtering)")
+
+        except Exception as e:
+            print(f"✗ Failed to load options data: {e}")
             return None
 
         return self
@@ -130,9 +149,8 @@ class DataLoader:
         return {'mu_J': 0.0, 'sigma_J': 0.05, 'lambda_j': 1.0}
 
     def get_contracts(self, symbol):
-        """Get contracts for a symbol"""
-        df = self.mis_data['data']
-        return df[df['underlying_symbol'] == symbol].copy()
+        """Get contracts for a symbol from cleaned options data"""
+        return self.options_data[self.options_data['underlying_symbol'] == symbol].copy()
 
 
 class HJBSolver:
@@ -552,10 +570,10 @@ def get_regime_for_date(regime_sequence, symbol, asofdate):
 
     return None
 
-
 def select_contracts(contracts):
     """
     Select best CALL and best PUT for HJB analysis
+    Focus: Near-ATM, medium-term options (good test cases for early exercise)
     Returns: {'call': contract_dict or None, 'put': contract_dict or None}
     """
     if len(contracts) == 0:
@@ -575,11 +593,11 @@ def select_contracts(contracts):
     # === SELECT BEST PUT ===
     puts = valid[valid['option_type'] == 'put']
     if len(puts) > 0:
-        # Prefer slightly ITM puts (log_moneyness > 0)
-        itm_puts = puts[(puts['log_moneyness'] > 0) & (puts['log_moneyness'] < 0.1)]
+        # Prefer near-ATM puts
+        atm_puts = puts[puts['abs_moneyness'] < 0.05]
 
-        if len(itm_puts) > 0:
-            best_put = itm_puts.nsmallest(1, 'abs_moneyness').iloc[0]
+        if len(atm_puts) > 0:
+            best_put = atm_puts.nsmallest(1, 'abs_moneyness').iloc[0]
         else:
             best_put = puts.nsmallest(1, 'abs_moneyness').iloc[0]
 
@@ -590,11 +608,11 @@ def select_contracts(contracts):
     # === SELECT BEST CALL ===
     calls = valid[valid['option_type'] == 'call']
     if len(calls) > 0:
-        # Prefer slightly ITM calls (log_moneyness < 0, since S > K)
-        itm_calls = calls[(calls['log_moneyness'] < 0) & (calls['log_moneyness'] > -0.1)]
+        # Prefer near-ATM calls
+        atm_calls = calls[calls['abs_moneyness'] < 0.05]
 
-        if len(itm_calls) > 0:
-            best_call = itm_calls.nsmallest(1, 'abs_moneyness').iloc[0]
+        if len(atm_calls) > 0:
+            best_call = atm_calls.nsmallest(1, 'abs_moneyness').iloc[0]
         else:
             best_call = calls.nsmallest(1, 'abs_moneyness').iloc[0]
 
@@ -608,12 +626,129 @@ def select_contracts(contracts):
 def main():
     """FIXED MAIN - Solves for BOTH calls and puts per symbol"""
 
-    loader = DataLoader().load_all()
-    if loader is None:
-        print("\n✗ Failed to load required data")
+    # Connect to database
+    print("\nConnecting to database...")
+    try:
+        conn = psycopg2.connect(
+            host='localhost',
+            database='options_data',
+            user='postgres',
+            password='postgres'  # UPDATE THIS
+        )
+        print("✓ Database connected")
+    except Exception as e:
+        print(f"✗ Database connection failed: {e}")
         return
 
-    regime_sequence = loader.hmm_data['regime_sequence']
+    # Load HMM and jump data first
+    print("\n" + "=" * 70)
+    print("LOADING PREVIOUS RESULTS")
+    print("=" * 70)
+
+    try:
+        with open('hmm_regime_model.pkl', 'rb') as f:
+            hmm_data = pickle.load(f)
+        print(f"✓ HMM: {hmm_data['n_regimes']} regimes loaded")
+    except FileNotFoundError:
+        print("✗ hmm_regime_model.pkl not found - run Step 2 first")
+        conn.close()
+        return
+
+    try:
+        with open('jump_detection_results.pkl', 'rb') as f:
+            jump_data = pickle.load(f)
+        print(f"✓ Jumps: {jump_data['total_jumps']} jumps detected")
+    except FileNotFoundError:
+        print("✗ jump_detection_results.pkl not found - run Step 3 first")
+        conn.close()
+        return
+
+    # Load and filter options data using Step 1 method
+    print("\n" + "=" * 70)
+    print("LOADING OPTIONS DATA")
+    print("=" * 70)
+
+    try:
+        # Query raw options data
+        query = """
+        SELECT
+            asofdate,
+            (data->'attributes'->>'strike')::float AS strike,
+            (data->'attributes'->>'exp_date') AS exp_date,
+            (data->'attributes'->>'type') AS option_type,
+            (data->'attributes'->>'bid')::float AS bid,
+            (data->'attributes'->>'ask')::float AS ask,
+            (data->'attributes'->>'last')::float AS last_price,
+            (data->'attributes'->>'midpoint')::float AS mid_price,
+            (data->'attributes'->>'volume')::float AS volume,
+            (data->'attributes'->>'open_interest')::float AS open_interest,
+            (data->'attributes'->>'volatility')::float AS volatility,
+            (data->'attributes'->>'underlying_symbol') AS underlying_symbol,
+            (data->'attributes'->>'delta')::float AS delta,
+            (data->'attributes'->>'gamma')::float AS gamma,
+            (data->'attributes'->>'theta')::float AS theta,
+            (data->'attributes'->>'vega')::float AS vega,
+            (data->'attributes'->>'dte')::float AS days_to_exp
+        FROM options
+        WHERE (data->'attributes'->>'underlying_symbol') = ANY(%s)
+        ORDER BY asofdate, underlying_symbol
+        """
+
+        df_raw = pd.read_sql(query, conn, params=(SYMBOLS,))
+        print(f"  Raw options: {len(df_raw):,} records")
+
+        # Apply Step 1 filters
+        options_data = get_clean_options_data(df_raw, conn, verbose=True)
+        print(f"✓ Options: {len(options_data):,} contracts (after filtering)")
+
+    except Exception as e:
+        print(f"✗ Failed to load options data: {e}")
+        import traceback
+        traceback.print_exc()
+        conn.close()
+        return
+
+    # Create a simple loader object to hold the data
+    class SimpleLoader:
+        def __init__(self, hmm, jump, options):
+            self.hmm_data = hmm
+            self.jump_data = jump
+            self.options_data = options
+
+        def get_regime_params(self, regime_idx):
+            p = self.hmm_data['regime_params'][regime_idx]
+            return {'mu': p['mu'], 'sigma': p['sigma']}
+
+        def get_jump_params(self, symbol, regime_idx):
+            if 'jump_params_by_regime' in self.jump_data:
+                regime_params = self.jump_data['jump_params_by_regime'].get(regime_idx, {})
+
+                if 'symbol_regime_jumps' in self.jump_data:
+                    symbol_params = self.jump_data['symbol_regime_jumps'].get(symbol, {}).get(regime_idx, {})
+                    n_jumps = symbol_params.get('n_jumps', 0)
+                    n_days = symbol_params.get('n_days', 0)
+                    lambda_j = symbol_params.get('lambda_j', 0)
+
+                    if n_jumps >= 3 and n_days >= 100 and lambda_j < 50:
+                        return {
+                            'mu_J': symbol_params.get('mu_J', regime_params.get('mu_J', 0.0)),
+                            'sigma_J': symbol_params.get('sigma_J', regime_params.get('sigma_J', 0.05)),
+                            'lambda_j': lambda_j
+                        }
+
+                return {
+                    'mu_J': regime_params.get('mu_J', 0.0),
+                    'sigma_J': regime_params.get('sigma_J', 0.05),
+                    'lambda_j': regime_params.get('lambda', 1.0)
+                }
+
+            return {'mu_J': 0.0, 'sigma_J': 0.05, 'lambda_j': 1.0}
+
+        def get_contracts(self, symbol):
+            return self.options_data[self.options_data['underlying_symbol'] == symbol].copy()
+
+    loader = SimpleLoader(hmm_data, jump_data, options_data)
+    regime_sequence = hmm_data['regime_sequence']
 
     print("\n" + "=" * 70)
     print("SOLVING HJB PDE FOR CALLS AND PUTS")
@@ -622,8 +757,8 @@ def main():
     results = {
         'generated': datetime.now().isoformat(),
         'solutions': {},
-        'n_regimes': loader.hmm_data['n_regimes'],
-        'regime_labels': loader.hmm_data['regime_labels']
+        'n_regimes': hmm_data['n_regimes'],
+        'regime_labels': hmm_data['regime_labels']
     }
 
     r = CONFIG['risk_free_rate']
@@ -640,7 +775,7 @@ def main():
             print(f"   No contracts for {symbol}")
             continue
 
-        # NEW: Get BOTH call and put
+        # Get BOTH call and put
         selected = select_contracts(contracts)
 
         results['solutions'][symbol] = {}
@@ -685,7 +820,7 @@ def main():
                     lambda_j=jp.get('lambda_j', 0.0),
                     mu_J=jp['mu_J'],
                     sigma_J=jp['sigma_J'],
-                    option_type=opt_type  # ← KEY: Pass the actual type
+                    option_type=opt_type
                 )
 
                 hjb_solution = solver.solve()
@@ -711,6 +846,9 @@ def main():
                 print(f"   ✗ Error solving {opt_type}: {e}")
                 import traceback
                 traceback.print_exc()
+
+    # Close database connection
+    conn.close()
 
     # Save
     with open(CONFIG['output_file'], 'wb') as f:
@@ -738,9 +876,8 @@ def main():
 
     print("=" * 70)
 
-
-
     return results
+
 
 if __name__ == "__main__":
     main()
