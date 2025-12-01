@@ -418,10 +418,16 @@ class MonteCarloSimulator:
 def create_visualization(results):
     """
     Create interactive visualization of Monte Carlo paths with optimal boundary
-    One separate HTML file per contract showing ALL 10,000 paths
-    Opens the first one automatically in browser
+    One separate HTML file per contract showing ALL paths
+
+    Features:
+    - Toggle: Color path segments that cross boundary as green
+    - Slider: Select individual path (1-10000)
+    - Toggle: Show jump locations with purple dots (hover for jump info)
+    - Hover: Show log returns from selected path's starting point
     """
     import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
     html_files = []
 
@@ -430,20 +436,18 @@ def create_visualization(results):
         hjb = r['hjb']
         paths = r['results']['paths']  # All paths from simulation
 
-        # Get ALL paths (not just first 100)
-        # Note: You'll need to modify evaluate_strategies to store all paths
-        # For now, we'll work with what's stored
-        n_paths_to_plot = paths.shape[0]
+        n_paths_total = paths.shape[0]
         n_steps = paths.shape[1]
         t_grid = np.linspace(0, contract['T'], n_steps)
         t_days = t_grid * 365
 
-        # Create individual figure for this contract
+        print(f"  Creating visualization for {key}...")
+
+        # Create figure with custom data for hover
         fig = go.Figure()
 
-        # Plot ALL Monte Carlo paths (light gray, very thin lines)
-        print(f"  Plotting {n_paths_to_plot} paths for {key}...")
-        for i in range(n_paths_to_plot):
+        # ===== LAYER 1: ALL PATHS (light gray, always visible) =====
+        for i in range(n_paths_total):
             fig.add_trace(
                 go.Scatter(
                     x=t_days,
@@ -452,11 +456,127 @@ def create_visualization(results):
                     line=dict(color='lightgray', width=0.3),
                     opacity=0.2,
                     showlegend=False,
-                    hoverinfo='skip'
+                    hoverinfo='skip',
+                    visible=True
                 )
             )
 
-        # Plot optimal exercise boundary (thick red line)
+        # ===== LAYER 2: PATHS COLORED GREEN WHERE THEY CROSS BOUNDARY =====
+        # Pre-calculate which segments cross the boundary
+        boundary_interp = np.interp(t_days, hjb['t_grid'] * 365, hjb['boundaries'])
+
+        for i in range(n_paths_total):
+            # Determine where path crosses boundary
+            if contract['option_type'] == 'put':
+                crosses = paths[i, :] <= boundary_interp
+            else:  # call
+                crosses = paths[i, :] >= boundary_interp
+
+            # Only plot segments that cross
+            if np.any(crosses):
+                cross_x = t_days[crosses]
+                cross_y = paths[i, crosses]
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=cross_x,
+                        y=cross_y,
+                        mode='lines',
+                        line=dict(color='green', width=0.5),
+                        opacity=0.4,
+                        showlegend=False,
+                        hoverinfo='skip',
+                        visible=False,  # Hidden by default, toggle with button
+                        name='crossed_boundary'
+                    )
+                )
+            else:
+                # Add placeholder to keep indexing consistent
+                fig.add_trace(
+                    go.Scatter(
+                        x=[],
+                        y=[],
+                        visible=False,
+                        name='crossed_boundary'
+                    )
+                )
+
+        # ===== LAYER 3: INDIVIDUAL PATH SELECTION (with log returns) =====
+        # Create traces for each individual path (hidden by default)
+        for i in range(n_paths_total):
+            # Calculate log returns from start for this path
+            log_returns = np.log(paths[i, :] / paths[i, 0])
+
+            # Create hover text with log returns
+            hover_text = [
+                f"Day: {t_days[j]:.1f}<br>"
+                f"Price: ${paths[i, j]:.2f}<br>"
+                f"Log Return: {log_returns[j]:.4f} ({log_returns[j] * 100:.2f}%)"
+                for j in range(n_steps)
+            ]
+
+            fig.add_trace(
+                go.Scatter(
+                    x=t_days,
+                    y=paths[i, :],
+                    mode='lines',
+                    line=dict(color='blue', width=2),
+                    name=f'Path {i + 1}',
+                    visible=False,  # Hidden by default
+                    hovertext=hover_text,
+                    hoverinfo='text',
+                    legendgroup='selected_path'
+                )
+            )
+
+        # ===== LAYER 4: JUMP DETECTION MARKERS =====
+        # Detect jumps: large single-step moves
+        jump_threshold = 0.05  # 5% single-step move considered a "jump"
+
+        for i in range(n_paths_total):
+            returns = np.diff(np.log(paths[i, :]))
+            jump_mask = np.abs(returns) > jump_threshold
+            jump_indices = np.where(jump_mask)[0] + 1  # +1 because diff reduces length
+
+            if len(jump_indices) > 0:
+                jump_days = t_days[jump_indices]
+                jump_prices = paths[i, jump_indices]
+                jump_magnitudes = returns[jump_mask]
+
+                hover_text = [
+                    f"JUMP!<br>"
+                    f"Day: {jump_days[j]:.1f}<br>"
+                    f"Magnitude: {jump_magnitudes[j]:.4f} ({jump_magnitudes[j] * 100:.2f}%)<br>"
+                    f"Path {i + 1}, Jump #{j + 1}/{len(jump_indices)}"
+                    for j in range(len(jump_indices))
+                ]
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=jump_days,
+                        y=jump_prices,
+                        mode='markers',
+                        marker=dict(color='purple', size=6, symbol='circle'),
+                        name=f'Jumps Path {i + 1}',
+                        visible=False,
+                        hovertext=hover_text,
+                        hoverinfo='text',
+                        legendgroup='jumps'
+                    )
+                )
+            else:
+                # Add placeholder
+                fig.add_trace(
+                    go.Scatter(
+                        x=[],
+                        y=[],
+                        visible=False,
+                        name='jumps'
+                    )
+                )
+
+        # ===== STATIC ELEMENTS =====
+        # Optimal exercise boundary (thick red line)
         boundary_t_grid = hjb['t_grid']
         boundary_values = hjb['boundaries']
         boundary_days = boundary_t_grid * 365
@@ -467,50 +587,153 @@ def create_visualization(results):
                 y=boundary_values,
                 mode='lines',
                 line=dict(color='red', width=4),
-                name='Optimal Exercise Boundary'
+                name='Optimal Boundary',
+                hovertemplate='Day: %{x:.1f}<br>Boundary: $%{y:.2f}<extra></extra>'
             )
         )
 
-        # Plot strike price (dashed black line)
+        # Strike price (dashed black line)
         fig.add_trace(
             go.Scatter(
                 x=[0, contract['T'] * 365],
                 y=[contract['K'], contract['K']],
                 mode='lines',
                 line=dict(color='black', width=3, dash='dash'),
-                name='Strike Price'
+                name='Strike Price',
+                hovertemplate='Strike: $%{y:.2f}<extra></extra>'
             )
         )
 
-        # Plot initial spot price (green dot)
+        # Initial spot price (green dot)
         fig.add_trace(
             go.Scatter(
                 x=[0],
                 y=[contract['S0']],
                 mode='markers',
-                marker=dict(color='green', size=12, symbol='circle'),
-                name='Initial Price'
+                marker=dict(color='darkgreen', size=12, symbol='circle'),
+                name='Initial Price',
+                hovertemplate='Start: $%{y:.2f}<extra></extra>'
             )
+        )
+
+        # ===== CREATE INTERACTIVE CONTROLS =====
+        # Calculate trace indices
+        n_base_paths = n_paths_total
+        n_crossed_paths = n_paths_total
+        n_individual_paths = n_paths_total
+        n_jump_traces = n_paths_total
+        n_static = 3  # boundary, strike, initial
+
+        # Button 1: Toggle green crossed-boundary segments
+        button_toggle_green = dict(
+            label="Show Boundary Crossings",
+            method="update",
+            args=[
+                {"visible": [True] * n_base_paths +  # Base paths always on
+                            [True] * n_crossed_paths +  # Toggle these
+                            [False] * n_individual_paths +  # Keep hidden
+                            [False] * n_jump_traces +  # Keep hidden
+                            [True] * n_static},  # Static always on
+                {}
+            ]
+        )
+
+        button_hide_green = dict(
+            label="Hide Boundary Crossings",
+            method="update",
+            args=[
+                {"visible": [True] * n_base_paths +
+                            [False] * n_crossed_paths +
+                            [False] * n_individual_paths +
+                            [False] * n_jump_traces +
+                            [True] * n_static},
+                {}
+            ]
+        )
+
+        # Slider: Select individual path
+        slider_steps = []
+        for i in range(n_paths_total):
+            # For each slider position, show only that path and optionally its jumps
+            visible = [True] * n_base_paths + [False] * n_crossed_paths
+            visible += [False] * n_individual_paths
+            visible[n_base_paths + n_crossed_paths + i] = True  # Show this path
+            visible += [False] * n_jump_traces
+            visible[n_base_paths + n_crossed_paths + n_individual_paths + i] = True  # Show this path's jumps
+            visible += [True] * n_static
+
+            slider_steps.append(dict(
+                method="update",
+                args=[{"visible": visible}],
+                label=str(i + 1)
+            ))
+
+        slider = dict(
+            active=0,
+            currentvalue={"prefix": "Selected Path: "},
+            pad={"t": 50},
+            steps=slider_steps
+        )
+
+        # Button 2: Toggle jump markers
+        button_show_jumps = dict(
+            label="Show Jumps",
+            method="restyle",
+            args=[{"visible": True}, list(range(
+                n_base_paths + n_crossed_paths + n_individual_paths,
+                n_base_paths + n_crossed_paths + n_individual_paths + n_jump_traces
+            ))]
+        )
+
+        button_hide_jumps = dict(
+            label="Hide Jumps",
+            method="restyle",
+            args=[{"visible": False}, list(range(
+                n_base_paths + n_crossed_paths + n_individual_paths,
+                n_base_paths + n_crossed_paths + n_individual_paths + n_jump_traces
+            ))]
         )
 
         # Build detailed title
         title_text = (
             f"{contract['symbol']} {contract['option_type'].upper()} Option - "
-            f"Monte Carlo Simulation ({n_paths_to_plot:,} paths)<br>"
+            f"Monte Carlo Simulation ({n_paths_total:,} paths)<br>"
             f"<sub>Strike: ${contract['K']:.2f} | Spot: ${contract['S0']:.2f} | "
             f"Time to Expiry: {contract['T'] * 365:.0f} days | "
             f"Regime: {contract['regime']}</sub>"
         )
 
+        # Update layout with controls
         fig.update_layout(
             title=title_text,
             xaxis_title="Days to Expiration",
             yaxis_title="Underlying Price ($)",
-            height=800,
-            width=1400,
+            height=900,
+            width=1600,
             showlegend=True,
             hovermode='closest',
-            template='plotly_white'
+            template='plotly_white',
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    direction="left",
+                    buttons=[button_toggle_green, button_hide_green],
+                    x=0.0,
+                    xanchor="left",
+                    y=1.15,
+                    yanchor="top"
+                ),
+                dict(
+                    type="buttons",
+                    direction="left",
+                    buttons=[button_show_jumps, button_hide_jumps],
+                    x=0.3,
+                    xanchor="left",
+                    y=1.15,
+                    yanchor="top"
+                )
+            ],
+            sliders=[slider]
         )
 
         # Save to individual file

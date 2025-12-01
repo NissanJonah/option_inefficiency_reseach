@@ -207,6 +207,7 @@ print(f"✓ Loaded {initial_count:,} raw option quotes")
 # APPLY STANDARDIZED FILTERS
 # ================================
 conn = connect_to_db()  # Reopen connection for filtering
+
 if conn is None:
     raise SystemExit("DB connection failed")
 
@@ -452,43 +453,61 @@ print("\n" + "="*70)
 print("STEP 7: BUILDING SMOOTH IV SURFACES")
 print("="*70)
 
+
 def build_iv_surface_for_day(day_data):
-    """Build smooth IV surface for a single day"""
+    """Build smooth IV surface for a single day - FIXED"""
+
+    # STEP 1: Bucket contracts into DTE_GRID bins FIRST
+    day_data = day_data.copy()
+
+    # Assign each contract to nearest DTE bucket
+    dte_days = day_data['tte'] * 365.25
+    day_data['dte_bucket'] = day_data['tte'].apply(
+        lambda t: DTE_GRID[np.argmin(np.abs(DTE_GRID - t * 365.25))] / 365.25
+    )
+
     surfaces = []
 
-    for tte, group in day_data.groupby('tte'):
+    # STEP 2: Group by DTE bucket (not exact TTE)
+    for tte_bucket, group in day_data.groupby('dte_bucket'):
         group = group.copy()
-        group['log_moneyness_rounded'] = group['log_moneyness'].round(6)
+        group['log_moneyness_rounded'] = group['log_moneyness'].round(3)  # Round to 0.001
 
+        # Aggregate duplicates at same moneyness
         agg_group = group.groupby('log_moneyness_rounded').agg({
             'log_moneyness': 'mean',
             'clean_iv': 'mean'
         }).reset_index(drop=True)
 
         x = agg_group['log_moneyness'].values
-        v = agg_group['clean_iv'].values ** 2 * tte
+        v = agg_group['clean_iv'].values ** 2 * tte_bucket  # Use bucket TTE
 
+        # Sort by moneyness
         idx = np.argsort(x)
         x, v = x[idx], v[idx]
 
-        mask = np.concatenate([[True], np.diff(x) > 0])
+        # Remove duplicates
+        mask = np.concatenate([[True], np.diff(x) > 0.001])  # Tolerance for duplicates
         x, v = x[mask], v[mask]
 
         if len(x) < 3:
             continue
 
         try:
+            # Interpolate to MONEYNESS_GRID
             spl = PchipInterpolator(x, v, extrapolate=False)
             var_interp = spl(MONEYNESS_GRID)
             var_interp = np.maximum(var_interp, 0)
-            iv_interp = np.sqrt(np.maximum(var_interp / tte, 0))
-            surfaces.append((tte, iv_interp))
-        except:
+
+            iv_interp = np.sqrt(np.maximum(var_interp / tte_bucket, 0))
+            surfaces.append((tte_bucket, iv_interp))
+        except Exception as e:
             continue
 
     if not surfaces:
         return None
 
+    # STEP 3: Build final grid (now have data at DTE_GRID points)
     surfaces = sorted(surfaces, key=lambda x: x[0])
     ttes, iv_rows = zip(*surfaces)
 
@@ -497,39 +516,41 @@ def build_iv_surface_for_day(day_data):
 
     tte_grid_years = DTE_GRID / 365.25
 
+    # Direct assignment for buckets we have
+    for tte, iv_row in zip(ttes, iv_rows):
+        dte_idx = np.argmin(np.abs(tte_grid_years - tte))
+        grid_final[dte_idx, :] = iv_row
+
+    # STEP 4: Fill missing DTE rows via interpolation
     for j in range(len(MONEYNESS_GRID)):
-        # Collect total variance for this moneyness across all available T
-        total_variance = []
-        available_tte = []
+        # Find rows with valid data for this moneyness
+        valid_rows = ~np.isnan(grid_final[:, j])
 
-        for i, (t, iv_row) in enumerate(zip(ttes, iv_rows)):
-            if not np.isnan(iv_row[j]):
-                total_variance.append(iv_row[j] ** 2 * t)
-                available_tte.append(t)
-
-        if len(total_variance) < 2:
+        if valid_rows.sum() < 2:
+            # Not enough data - leave as NaN
             continue
 
-        # Sort by maturity
-        idx = np.argsort(available_tte)
-        available_tte = np.array(available_tte)[idx]
-        total_variance = np.array(total_variance)[idx]
+        valid_ttes = tte_grid_years[valid_rows]
+        valid_ivs = grid_final[valid_rows, j]
 
-        # ENFORCE MONOTONICITY: total variance must be non-decreasing
-        total_variance = np.maximum.accumulate(total_variance)
+        # Interpolate total variance (monotonic)
+        total_var = valid_ivs ** 2 * valid_ttes
+        total_var = np.maximum.accumulate(total_var)
 
-        # Interpolate monotonic total variance
         try:
-            f = interp1d(available_tte, total_variance, kind='linear',
+            # Interpolate to fill gaps
+            f = interp1d(valid_ttes, total_var, kind='linear',
                          bounds_error=False, fill_value='extrapolate')
             total_var_interp = f(tte_grid_years)
 
-            # Convert back to implied volatility
-            grid_final[:, j] = np.sqrt(total_var_interp / np.maximum(tte_grid_years, 1 / 36525))
+            # Convert back to IV
+            grid_final[:, j] = np.sqrt(total_var_interp / np.maximum(tte_grid_years, 1 / 365.25))
         except:
             continue
 
+    # Floor at 3% to avoid unrealistic low vols
     grid_final = np.maximum(grid_final, 0.03)
+
     return grid_final
 
 surfaces = {}
@@ -565,6 +586,357 @@ for symbol in SYMBOLS:
 
 print(f"\n✓ Total surfaces built: {total_built}")
 
+# ==============
+# 9. verify for hjb
+# ==============
+
+"""
+ADD THESE FUNCTIONS TO STEP 4 - Surface Validation for HJB Compatibility
+Insert after build_iv_surface_for_day() and before main surface building loop
+"""
+
+import numpy as np
+import pandas as pd
+
+
+def validate_surface_for_hjb(surface_grid, moneyness_grid, dte_grid_years, symbol, date_str):
+    """
+    Validate that IV surface has sufficient coverage for HJB solver
+
+    HJB needs:
+    - ATM region: -0.05 to +0.05 log-moneyness (near-the-money contracts)
+    - Medium-term: 30-180 days (0.082 to 0.493 years)
+    - No large NaN gaps
+
+    Returns:
+    --------
+    dict with validation results
+    """
+    if surface_grid is None:
+        return {
+            'valid': False,
+            'reason': 'Surface is None',
+            'coverage': 0.0,
+            'atm_coverage': 0.0,
+            'medium_term_coverage': 0.0
+        }
+
+    # Overall NaN coverage
+    total_points = surface_grid.size
+    valid_points = (~np.isnan(surface_grid)).sum()
+    coverage_pct = (valid_points / total_points) * 100
+
+    # ATM region coverage (-0.05 to +0.05 log-moneyness)
+    atm_mask = (moneyness_grid >= -0.05) & (moneyness_grid <= 0.05)
+    atm_idx = np.where(atm_mask)[0]
+
+    if len(atm_idx) == 0:
+        atm_coverage = 0.0
+    else:
+        atm_surface = surface_grid[:, atm_idx]
+        atm_valid = (~np.isnan(atm_surface)).sum()
+        atm_coverage = (atm_valid / atm_surface.size) * 100
+
+    # Medium-term coverage (30-180 days)
+    medium_term_mask = (dte_grid_years >= 0.082) & (dte_grid_years <= 0.493)
+    medium_idx = np.where(medium_term_mask)[0]
+
+    if len(medium_idx) == 0:
+        medium_coverage = 0.0
+    else:
+        medium_surface = surface_grid[medium_idx, :]
+        medium_valid = (~np.isnan(medium_surface)).sum()
+        medium_coverage = (medium_valid / medium_surface.size) * 100
+
+    # Critical region: ATM + medium-term
+    if len(atm_idx) > 0 and len(medium_idx) > 0:
+        critical_surface = surface_grid[np.ix_(medium_idx, atm_idx)]
+        critical_valid = (~np.isnan(critical_surface)).sum()
+        critical_coverage = (critical_valid / critical_surface.size) * 100
+    else:
+        critical_coverage = 0.0
+
+    # Validation criteria for HJB
+    is_valid = (
+            coverage_pct >= 30 and  # At least 30% overall coverage
+            atm_coverage >= 50 and  # At least 50% ATM coverage
+            critical_coverage >= 40  # At least 40% in critical region
+    )
+
+    # Identify gaps
+    gaps = []
+    if coverage_pct < 30:
+        gaps.append(f"Low overall coverage: {coverage_pct:.1f}%")
+    if atm_coverage < 50:
+        gaps.append(f"Poor ATM coverage: {atm_coverage:.1f}%")
+    if critical_coverage < 40:
+        gaps.append(f"Insufficient medium-term ATM data: {critical_coverage:.1f}%")
+
+    reason = "; ".join(gaps) if gaps else "Sufficient coverage"
+
+    return {
+        'valid': is_valid,
+        'reason': reason,
+        'coverage': coverage_pct,
+        'atm_coverage': atm_coverage,
+        'medium_term_coverage': medium_coverage,
+        'critical_coverage': critical_coverage,
+        'total_valid_points': int(valid_points),
+        'total_points': int(total_points)
+    }
+
+
+def test_hjb_contract_interpolation(surfaces_dict, moneyness_grid, dte_grid_years, symbols):
+    """
+    Test whether typical HJB contracts would successfully interpolate
+    """
+    from scipy.interpolate import RegularGridInterpolator
+
+    def find_nearest_valid_iv(surface_grid, dte_grid_years, moneyness_grid, tte, log_m):
+        """Find nearest non-NaN value in grid"""
+        tte_idx = np.argmin(np.abs(dte_grid_years - tte))
+        m_idx = np.argmin(np.abs(moneyness_grid - log_m))
+
+        for radius in range(0, min(len(dte_grid_years), len(moneyness_grid))):
+            for dt in range(-radius, radius + 1):
+                for dm in range(-radius, radius + 1):
+                    t_i = tte_idx + dt
+                    m_i = m_idx + dm
+
+                    if (0 <= t_i < len(dte_grid_years) and
+                            0 <= m_i < len(moneyness_grid)):
+                        val = surface_grid[t_i, m_i]
+                        if not np.isnan(val) and 0.01 < val < 5.0:
+                            return val
+        return np.nan
+
+    test_cases = []
+
+    for symbol in symbols:
+        if symbol not in surfaces_dict:
+            continue
+
+        dates = list(surfaces_dict[symbol].keys())
+        test_dates = dates[::10] if len(dates) > 20 else dates
+
+        for date_str in test_dates:
+            surface_data = surfaces_dict[symbol][date_str]
+            surface_grid = np.array(surface_data['iv_surface'])
+
+            if np.isnan(surface_grid).all():
+                test_cases.append({
+                    'symbol': symbol,
+                    'date': date_str,
+                    'test_type': 'ATM_30d',
+                    'success': False,
+                    'iv': np.nan,
+                    'error': 'Surface all NaN'
+                })
+                continue
+
+            test_configs = [
+                {'name': 'ATM_30d', 'log_m': 0.0, 'tte': 30 / 365.25},
+                {'name': 'ATM_60d', 'log_m': 0.0, 'tte': 60 / 365.25},
+                {'name': 'ATM_90d', 'log_m': 0.0, 'tte': 90 / 365.25},
+                {'name': 'OTM_Put_60d', 'log_m': 0.05, 'tte': 60 / 365.25},
+                {'name': 'ITM_Put_60d', 'log_m': -0.05, 'tte': 60 / 365.25},
+            ]
+
+            for config in test_configs:
+                log_m = config['log_m']
+                tte = config['tte']
+
+                log_m_clamped = np.clip(log_m, moneyness_grid[0], moneyness_grid[-1])
+                tte_clamped = np.clip(tte, dte_grid_years[0], dte_grid_years[-1])
+
+                try:
+                    # NEW: Use RegularGridInterpolator with NaN handling
+                    interp = RegularGridInterpolator(
+                        (dte_grid_years, moneyness_grid),
+                        surface_grid,
+                        method='linear',
+                        bounds_error=False,
+                        fill_value=None
+                    )
+
+                    iv = float(interp([tte_clamped, log_m_clamped])[0])
+
+                    # If still NaN, find nearest valid point
+                    if np.isnan(iv):
+                        iv = find_nearest_valid_iv(surface_grid, dte_grid_years,
+                                                   moneyness_grid, tte_clamped, log_m_clamped)
+
+                    # Check validity
+                    if np.isnan(iv) or iv < 0.01 or iv > 5.0:
+                        success = False
+                        error = f'Invalid IV: {iv:.4f}'
+                    else:
+                        success = True
+                        error = None
+
+                    test_cases.append({
+                        'symbol': symbol,
+                        'date': date_str,
+                        'test_type': config['name'],
+                        'success': success,
+                        'iv': iv,
+                        'error': error,
+                        'log_m': log_m,
+                        'tte': tte
+                    })
+
+                except Exception as e:
+                    test_cases.append({
+                        'symbol': symbol,
+                        'date': date_str,
+                        'test_type': config['name'],
+                        'success': False,
+                        'iv': np.nan,
+                        'error': str(e),
+                        'log_m': log_m,
+                        'tte': tte
+                    })
+
+    return pd.DataFrame(test_cases)
+
+def print_hjb_validation_report(surfaces_dict, moneyness_grid, dte_grid_years, symbols):
+    """
+    Generate comprehensive validation report for HJB compatibility
+    """
+    print("\n" + "=" * 70)
+    print("HJB COMPATIBILITY VALIDATION REPORT")
+    print("=" * 70)
+
+    # Step 1: Validate each surface
+    print("\n1. SURFACE COVERAGE ANALYSIS")
+    print("-" * 70)
+
+    validation_results = []
+
+    for symbol in symbols:
+        if symbol not in surfaces_dict:
+            print(f"\n{symbol}: No surfaces built")
+            continue
+
+        print(f"\n{symbol}:")
+        dates = list(surfaces_dict[symbol].keys())
+
+        valid_count = 0
+        total_count = len(dates)
+
+        # Check sample of dates
+        sample_dates = dates[::max(1, len(dates) // 5)]  # Check every 5th date or all if < 5
+
+        for date_str in sample_dates:
+            surface_data = surfaces_dict[symbol][date_str]
+            surface_grid = np.array(surface_data['iv_surface'])
+
+            validation = validate_surface_for_hjb(
+                surface_grid, moneyness_grid, dte_grid_years, symbol, date_str
+            )
+
+            validation_results.append({
+                'symbol': symbol,
+                'date': date_str,
+                **validation
+            })
+
+            if validation['valid']:
+                valid_count += 1
+
+        valid_pct = (valid_count / len(sample_dates)) * 100 if sample_dates else 0
+
+        print(f"  Dates checked: {len(sample_dates)}")
+        print(f"  HJB-compatible: {valid_count}/{len(sample_dates)} ({valid_pct:.1f}%)")
+
+        if valid_count > 0:
+            avg_coverage = np.mean([v['coverage'] for v in validation_results if v['symbol'] == symbol])
+            avg_atm = np.mean([v['atm_coverage'] for v in validation_results if v['symbol'] == symbol])
+            print(f"  Avg overall coverage: {avg_coverage:.1f}%")
+            print(f"  Avg ATM coverage: {avg_atm:.1f}%")
+
+    # Step 2: Test interpolation for typical HJB contracts
+    print("\n" + "-" * 70)
+    print("2. HJB CONTRACT INTERPOLATION TEST")
+    print("-" * 70)
+
+    test_results = test_hjb_contract_interpolation(
+        surfaces_dict, moneyness_grid, dte_grid_years, symbols
+    )
+
+    if len(test_results) == 0:
+        print("No test cases could be run")
+        return
+
+    # Summary by test type
+    print("\nSuccess Rate by Contract Type:")
+    for test_type in test_results['test_type'].unique():
+        mask = test_results['test_type'] == test_type
+        success_rate = test_results[mask]['success'].mean() * 100
+        n_tests = mask.sum()
+        print(f"  {test_type:15s}: {success_rate:5.1f}% ({test_results[mask]['success'].sum()}/{n_tests})")
+
+    # Summary by symbol
+    print("\nSuccess Rate by Symbol:")
+    for symbol in symbols:
+        mask = test_results['symbol'] == symbol
+        if mask.sum() == 0:
+            continue
+        success_rate = test_results[mask]['success'].mean() * 100
+        n_tests = mask.sum()
+        print(f"  {symbol:6s}: {success_rate:5.1f}% ({test_results[mask]['success'].sum()}/{n_tests} tests passed)")
+
+    # Overall success rate
+    overall_success = test_results['success'].mean() * 100
+    print(f"\n{'=' * 70}")
+    print(f"OVERALL HJB COMPATIBILITY: {overall_success:.1f}%")
+
+    if overall_success >= 80:
+        print("✓ EXCELLENT - Surfaces are highly compatible with HJB solver")
+    elif overall_success >= 60:
+        print("✓ GOOD - Most HJB contracts will interpolate successfully")
+    elif overall_success >= 40:
+        print("⚠ FAIR - Some HJB contracts may fall back to regime volatility")
+    else:
+        print("✗ POOR - Most HJB contracts will use regime volatility fallback")
+
+    print("=" * 70)
+
+    # Identify problem areas
+    failures = test_results[~test_results['success']]
+    if len(failures) > 0:
+        print("\n3. FAILURE ANALYSIS")
+        print("-" * 70)
+
+        # Most common errors
+        error_counts = failures['error'].value_counts()
+        print("\nMost Common Errors:")
+        for error, count in error_counts.head(5).items():
+            print(f"  {error}: {count} occurrences")
+
+        # Problem symbols
+        problem_symbols = failures['symbol'].value_counts()
+        print("\nSymbols with Most Failures:")
+        for symbol, count in problem_symbols.head(5).items():
+            pct = (count / len(test_results[test_results['symbol'] == symbol])) * 100
+            print(f"  {symbol}: {count} failures ({pct:.1f}% of tests)")
+
+    return validation_results, test_results
+
+
+# ================================
+# MODIFY THE MAIN SURFACE BUILDING SECTION
+# ================================
+validation_results, test_results = print_hjb_validation_report(
+    surfaces,
+    MONEYNESS_GRID,
+    np.array(DTE_GRID) / 365.25,  # Convert to years
+    SYMBOLS
+)
+# ================================
+# Then continue with original save
+# ================================
+
 # ================================
 # 8. SAVE RESULTS
 # ================================
@@ -582,8 +954,12 @@ save_data = {
         'total_raw_quotes': int(initial_count),
         'total_clean_quotes': int(after_count),
         'pcp_corrections': int(pcp_corrections),
-
         'surfaces_built': int(total_built),
+    },
+    'hjb_validation': {
+        'validation_results': validation_results,
+        'test_results': test_results.to_dict('records') if len(test_results) > 0 else [],
+        'overall_success_rate': float(test_results['success'].mean()) if len(test_results) > 0 else 0.0
     }
 }
 
